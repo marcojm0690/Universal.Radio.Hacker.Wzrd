@@ -152,9 +152,9 @@ else:
         install_requires.append("PyQt6")
 
 setup(
-    name="urh",
+    name="wzrd6",
     version=version.VERSION,
-    description="Universal Radio Hacker: investigate wireless protocols like a boss",
+    description="wzrd6: investigate wireless protocols like a boss",
     long_description=read_long_description(),
     long_description_content_type="text/markdown",
     author="Johannes Pohl",
@@ -173,6 +173,8 @@ setup(
     zip_safe=False,
     entry_points={
         "console_scripts": [
+            "wzrd6 = urh.main:main",
+            "wzrd6_cli = urh.cli.urh_cli:main",
             "urh = urh.main:main",
             "urh_cli = urh.cli.urh_cli:main",
         ]

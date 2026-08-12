@@ -75,6 +75,25 @@ The official URH docker image is available [here](https://hub.docker.com/r/jopoh
 
 It is recommended to use __at least macOS 13__ when using the DMG available [here](https://github.com/jopohl/urh/releases).
 
+#### Apple Silicon (M1/M2/M3) - Run this fork from source
+On Apple Silicon, you can run this fork natively with Python 3.11+:
+
+```bash
+git clone https://github.com/jopohl/urh/
+cd urh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e .
+wzrd6
+```
+
+If you want to run without installing console scripts, use:
+
+```bash
+PYTHONPATH=src python src/urh/main.py
+```
+
 #### With brew
 URH is available as a [homebrew formula](https://formulae.brew.sh/formula/urh) so you can install it with
 ```commandline
@@ -104,6 +123,8 @@ python setup.py install
 ```
 
 And start the application by typing ```urh``` in a terminal.
+
+This fork also exposes the command ```wzrd6```.
 
 
 ## Articles

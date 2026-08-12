@@ -128,7 +128,7 @@ def main():
     if settings.read("theme_index", 0, int) > 0:
         os.environ["QT_QPA_PLATFORMTHEME"] = "fusion"
 
-    app = QApplication(["URH"] + sys.argv[1:])
+    app = QApplication(["WZRD6"] + sys.argv[1:])
     app.setWindowIcon(QIcon(":/icons/icons/appicon.png"))
 
     try:

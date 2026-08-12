@@ -13,6 +13,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import QMainWindow, QHeaderView, QMessageBox, QApplication
 
 from urh import settings, version
+from urh.controller.AIAnalysisTabController import AIAnalysisTabController
 from urh.controller.CompareFrameController import CompareFrameController
 from urh.controller.GeneratorTabController import GeneratorTabController
 from urh.controller.SignalTabController import SignalTabController
@@ -79,6 +80,11 @@ class MainController(QMainWindow):
         )
 
         self.ui.tab_simulator.layout().addWidget(self.simulator_tab_controller)
+
+        self.ai_analysis_tab_controller = AIAnalysisTabController(
+            self.compare_frame_controller, parent=self.ui.tab_ai
+        )
+        self.ui.tab_ai.layout().addWidget(self.ai_analysis_tab_controller)
 
         self.undo_group = QUndoGroup()
         self.undo_group.addStack(self.signal_tab_controller.signal_undo_stack)

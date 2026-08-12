@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=Universal Radio Hacker
+Name=wzrd6
 Comment=investigate wireless protocols like a boss
-Exec=/usr/bin/urh
-Icon=urh
+Exec=/usr/bin/wzrd6
+Icon=wzrd6
 Terminal=false
 Categories=HamRadio

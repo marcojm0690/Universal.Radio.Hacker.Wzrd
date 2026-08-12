@@ -59,23 +59,24 @@ if __name__ == "__main__":
     cmd.extend(["--distpath", "./pyinstaller"])
 
     urh_cmd = cmd + [
-        "--name=urh",
+        "--name=wzrd6",
         "--windowed",
         "--workpath",
-        "./urh_build",
+        "./wzrd6_build",
         os.path.join(urh_path, "src/urh/main.py"),
     ]
 
     urh_debug_cmd = cmd + [
-        "--name=urh_debug",
+        "--name=wzrd6_debug",
         "--workpath",
-        "./urh_debug_build",
+        "./wzrd6_debug_build",
         os.path.join(urh_path, "src/urh/main.py"),
     ]
 
     cli_cmd = cmd + [
+        "--name=wzrd6_cli",
         "--workpath",
-        "./urh_cli_build",
+        "./wzrd6_cli_build",
         os.path.join(urh_path, "src/urh/cli/urh_cli.py"),
     ]
 
@@ -87,14 +88,14 @@ if __name__ == "__main__":
 
         import plistlib
 
-        with open("pyinstaller/urh.app/Contents/Info.plist", "rb") as f:
+        with open("pyinstaller/wzrd6.app/Contents/Info.plist", "rb") as f:
             p = plistlib.load(f)
         p["NSHighResolutionCapable"] = True
         p["NSRequiresAquaSystemAppearance"] = True
         p[
             "NSMicrophoneUsageDescription"
-        ] = "URH needs access to your microphone to capture signals via Soundcard."
-        with open("pyinstaller/urh.app/Contents/Info.plist", "wb") as f:
+        ] = "wzrd6 needs access to your microphone to capture signals via Soundcard."
+        with open("pyinstaller/wzrd6.app/Contents/Info.plist", "wb") as f:
             plistlib.dump(p, f)
 
     else:
@@ -102,8 +103,8 @@ if __name__ == "__main__":
             run_pyinstaller(cmd)
 
         shutil.copy(
-            "./pyinstaller/urh_cli/urh_cli.exe", "./pyinstaller/urh/urh_cli.exe"
+            "./pyinstaller/wzrd6_cli/wzrd6_cli.exe", "./pyinstaller/wzrd6/wzrd6_cli.exe"
         )
         shutil.copy(
-            "./pyinstaller/urh_debug/urh_debug.exe", "./pyinstaller/urh/urh_debug.exe"
+            "./pyinstaller/wzrd6_debug/wzrd6_debug.exe", "./pyinstaller/wzrd6/wzrd6_debug.exe"
         )

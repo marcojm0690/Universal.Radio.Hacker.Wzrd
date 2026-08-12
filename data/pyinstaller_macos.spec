@@ -24,7 +24,7 @@ exe = EXE(pyz,
           a.scripts,
           [],
           exclude_binaries=True,
-          name='main',
+          name='wzrd6',
           debug=False,
           bootloader_ignore_signals=False,
           strip=False,
@@ -41,14 +41,14 @@ coll = COLLECT(exe,
                strip=False,
                upx=True,
                upx_exclude=[],
-               name='main')
+                             name='wzrd6')
 app = BUNDLE(coll,
-             name='main.app',
+                         name='wzrd6.app',
              icon='./data/icons/appicon.icns',
              bundle_identifier=None,
              info_plist={
             'NSRequiresAquaSystemAppearance': True,
-            'NSMicrophoneUsageDescription': 'URH needs access to your microphone to capture signals via Soundcard.',
-            'CFBundleDisplayName': 'URH',
-            'CFBundleName': 'URH'
+                        'NSMicrophoneUsageDescription': 'wzrd6 needs access to your microphone to capture signals via Soundcard.',
+                        'CFBundleDisplayName': 'wzrd6',
+                        'CFBundleName': 'wzrd6'
             },)
