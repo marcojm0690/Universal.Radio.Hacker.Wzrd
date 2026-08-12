@@ -11,7 +11,7 @@
    </rect>
   </property>
   <property name="windowTitle">
-    <string>wzrd6</string>
+    <string>wzrd6 - Universal Radio Hacker</string>
   </property>
   <property name="windowIcon">
    <iconset resource="urh.qrc">
