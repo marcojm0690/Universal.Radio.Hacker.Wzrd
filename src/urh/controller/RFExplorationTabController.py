@@ -157,7 +157,7 @@ class RfSampleWorker(QObject):
 
 
 class RFExplorationTabController(QWidget):
-    DEFAULT_FREQUENCIES = "433.920, 868.000"
+    DEFAULT_FREQUENCIES = "433.920, 868.000, 915.000"
     SAMPLE_RATES = [250000, 1000000, 2048000]
 
     def __init__(self, parent=None):
@@ -223,20 +223,26 @@ class RFExplorationTabController(QWidget):
 
         self.ui_chkAuto = QCheckBox("Auto-sample while moving")
         self.ui_chkAuto.setChecked(True)
-        controls.addWidget(self.ui_chkAuto, 1, 0, 1, 2)
+        controls.addWidget(self.ui_chkAuto, 1, 3, 1, 2)
 
-        controls.addWidget(QLabel("Spacing (m):"), 1, 2)
+        controls.addWidget(QLabel("Device:"), 1, 0)
+        self.ui_cbDevice = QComboBox()
+        controls.addWidget(self.ui_cbDevice, 1, 1)
+        self.ui_btnRefreshDevice = QPushButton("Refresh")
+        controls.addWidget(self.ui_btnRefreshDevice, 1, 2)
+
+        controls.addWidget(QLabel("Spacing (m):"), 1, 5)
         self.ui_spinSpacing = QDoubleSpinBox()
         self.ui_spinSpacing.setRange(1, 200)
         self.ui_spinSpacing.setValue(6.0)
         self.ui_spinSpacing.setDecimals(1)
-        controls.addWidget(self.ui_spinSpacing, 1, 3)
+        controls.addWidget(self.ui_spinSpacing, 1, 6)
 
-        controls.addWidget(QLabel("Dwell (s):"), 1, 4)
+        controls.addWidget(QLabel("Dwell (s):"), 1, 7)
         self.ui_spinDwell = QSpinBox()
         self.ui_spinDwell.setRange(2, 600)
         self.ui_spinDwell.setValue(10)
-        controls.addWidget(self.ui_spinDwell, 1, 5)
+        controls.addWidget(self.ui_spinDwell, 1, 8)
 
         controls.addWidget(QLabel("Show:"), 2, 0)
         self.ui_cbFreqDisplay = QComboBox()
@@ -631,7 +637,10 @@ class RFExplorationTabController(QWidget):
             self.ui_lblRms.setText("-")
             self.ui_lblConfidence.setText("-")
 
-        cen = weighted_centroid(samples) if len(samples) >= 2 else None
+        cen = None
+        if len(samples) >= 2:
+            coords = [(s["lat"], s["lon"], s["rssi"]) for s in samples]
+            cen = weighted_centroid(coords)
         if cen is not None:
             self.ui_lblCentroid.setText("{0:.6f}, {1:.6f}".format(cen[0], cen[1]))
         else:

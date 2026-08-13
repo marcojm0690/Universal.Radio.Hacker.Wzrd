@@ -192,6 +192,72 @@ class NmeaGpsProvider(GpsProvider, threading.Thread):
         super().stop()
 
 
+def _core_location_delegate_class():
+    """Create the CoreLocation delegate Objective-C class exactly once.
+
+    PyObjC registers Objective-C classes by name, so redefining a nested class
+    on every start() raises "is overriding existing Objective-C class". The
+    provider instance is attached to each delegate instance as `_provider`.
+    """
+    try:
+        from Foundation import NSObject
+    except ImportError:
+        return None
+
+    cls = getattr(_core_location_delegate_class, "_cls", None)
+    if cls is not None:
+        return cls
+
+    class _CoreLocationDelegate(NSObject):
+        def locationManager_didUpdateLocations_(self, manager, locations):
+            provider = getattr(self, "_provider", None)
+            if provider is None:
+                return
+            loc = locations.lastObject()
+            if loc is None:
+                return
+            coord = loc.coordinate()
+            provider.position = (coord.latitude, coord.longitude, loc.altitude())
+            provider.fix_quality = 1
+            provider.num_satellites = 0
+            provider.hdop = 0.0
+            provider.last_update = time.time()
+            provider.error = None
+            provider.status_message = None
+
+        def locationManager_didFailWithError_(self, manager, error):
+            provider = getattr(self, "_provider", None)
+            if provider is None:
+                return
+            try:
+                code = int(error.code())
+            except Exception:
+                code = -1
+            provider._set_error_from_code(code)
+            logger.warning(
+                "CoreLocation error code {0}: {1}".format(
+                    code, error.localizedDescription()
+                )
+            )
+
+        def locationManagerDidChangeAuthorization_(self, manager):
+            provider = getattr(self, "_provider", None)
+            if provider is None:
+                return
+            status = int(manager.authorizationStatus())
+            provider.authorization_status = status
+            logger.info(
+                "CoreLocation authorization status: {0} ({1})".format(
+                    status, provider.AUTHORIZATION_LABELS.get(status, "?")
+                )
+            )
+            if status == 0 and hasattr(manager, "requestWhenInUseAuthorization"):
+                manager.requestWhenInUseAuthorization()
+
+    _core_location_delegate_class._cls = _CoreLocationDelegate
+    return _CoreLocationDelegate
+
+
 class CoreLocationGpsProvider(GpsProvider):
     """macOS Location Services fallback (no GPS hardware needed).
 
@@ -235,56 +301,19 @@ class CoreLocationGpsProvider(GpsProvider):
     def start(self):
         try:
             import CoreLocation
-            from Foundation import NSObject
         except ImportError as e:
             self.error = "PyObjC/CoreLocation not available: {0}".format(e)
             logger.error(self.error)
             return
 
-        provider = self
+        delegate_class = _core_location_delegate_class()
+        if delegate_class is None:
+            self.error = "PyObjC/Foundation not available"
+            logger.error(self.error)
+            return
 
-        class _Delegate(NSObject):
-            def locationManager_didUpdateLocations_(self, manager, locations):
-                loc = locations.lastObject()
-                if loc is None:
-                    return
-                coord = loc.coordinate()
-                provider.position = (
-                    coord.latitude,
-                    coord.longitude,
-                    loc.altitude(),
-                )
-                provider.fix_quality = 1
-                provider.num_satellites = 0
-                provider.hdop = 0.0
-                provider.last_update = time.time()
-                provider.error = None
-                provider.status_message = None
-
-            def locationManager_didFailWithError_(self, manager, error):
-                try:
-                    code = int(error.code())
-                except Exception:
-                    code = -1
-                provider._set_error_from_code(code)
-                logger.warning(
-                    "CoreLocation error code {0}: {1}".format(
-                        code, error.localizedDescription()
-                    )
-                )
-
-            def locationManagerDidChangeAuthorization_(self, manager):
-                status = int(manager.authorizationStatus())
-                provider.authorization_status = status
-                logger.info(
-                    "CoreLocation authorization status: {0} ({1})".format(
-                        status, provider.AUTHORIZATION_LABELS.get(status, "?")
-                    )
-                )
-                if status == 0 and hasattr(manager, "requestWhenInUseAuthorization"):
-                    manager.requestWhenInUseAuthorization()
-
-        self._delegate = _Delegate.alloc().init()
+        self._delegate = delegate_class.alloc().init()
+        self._delegate._provider = self
         self._manager = CoreLocation.CLLocationManager.alloc().init()
         self._manager.setDelegate_(self._delegate)
         self._manager.setDesiredAccuracy_(
