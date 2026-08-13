@@ -10,6 +10,23 @@ except ImportError:  # pragma: no cover
     serial = None
 
 
+USB_PORT_PATTERNS = (
+    "/dev/cu.usbserial-*",
+    "/dev/cu.usbmodem*",
+    "/dev/cu.PL2303*",
+    "/dev/cu.ESP32*",
+    "/dev/cu.SLAB_USBtoUART*",
+    "/dev/cu.wchusbserial*",
+    "/dev/tty.usbserial-*",
+    "/dev/tty.usbmodem*",
+)
+
+GPS_SOURCE_AUTO = "auto"
+GPS_SOURCE_USB = "usb"
+GPS_SOURCE_CORELOCATION = "corelocation"
+GPS_SOURCE_OFF = "off"
+
+
 def _parse_lat_lon(value: str, hemi: str) -> float:
     """Convert NMEA DDMM.MMMM (+ hemisphere) to decimal degrees."""
     try:
@@ -23,6 +40,30 @@ def _parse_lat_lon(value: str, hemi: str) -> float:
         return 0.0
 
 
+def detect_usb_ports():
+    """Return all serial ports that look like USB GNSS receivers (sorted, dedup)."""
+    if serial is None:
+        return []
+    import glob
+
+    ports = []
+    for pattern in USB_PORT_PATTERNS:
+        for match in glob.glob(pattern):
+            if match not in ports:
+                ports.append(match)
+    return sorted(ports)
+
+
+def core_location_available() -> bool:
+    try:
+        import CoreLocation  # noqa: F401
+        import Foundation  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 class GpsProvider(object):
     """Base class for GPS position providers."""
 
@@ -33,6 +74,7 @@ class GpsProvider(object):
         self.hdop = 0.0
         self.last_update = 0.0
         self.error = None
+        self.status_message = None
         self.running = False
 
     def start(self):
@@ -59,23 +101,8 @@ class NmeaGpsProvider(GpsProvider, threading.Thread):
 
     @staticmethod
     def detect_port():
-        if serial is None:
-            return None
-        import glob
-
-        candidates = [
-            "/dev/cu.usbserial-*",
-            "/dev/cu.usbmodem*",
-            "/dev/cu.PL2303*",
-            "/dev/cu.ESP32*",
-            "/dev/tty.usbserial-*",
-            "/dev/tty.usbmodem*",
-        ]
-        for pattern in candidates:
-            matches = sorted(glob.glob(pattern))
-            if matches:
-                return matches[0]
-        return None
+        ports = detect_usb_ports()
+        return ports[0] if ports else None
 
     def open_serial(self):
         if serial is None:
@@ -138,6 +165,8 @@ class NmeaGpsProvider(GpsProvider, threading.Thread):
                 self.num_satellites = int(float(fields[7])) if fields[7] else 0
                 self.hdop = float(fields[8]) if fields[8] else 0.0
                 self.last_update = time.time()
+                self.error = None
+                self.status_message = None
             elif fields[0].endswith("RMC"):
                 # RMC,utc,status,lat,lat_h,lon,lon_h,speed,course,date,...
                 if len(fields) < 7 or fields[2] not in ("A", "V"):
@@ -166,15 +195,42 @@ class NmeaGpsProvider(GpsProvider, threading.Thread):
 class CoreLocationGpsProvider(GpsProvider):
     """macOS Location Services fallback (no GPS hardware needed).
 
-    Uses CoreLocation via PyObjC. Accuracy is Wi-Fi/network based (~100 m - 1 km),
-    but it works on any Mac. The OS may show a location authorization prompt.
+    Uses CoreLocation via PyObjC. Accuracy is Wi-Fi/network based (~100 m - 1 km).
+    Requires location permission; a bare Python process may need the parent app
+    (Terminal/iTerm) to have location access under System Settings > Privacy &
+    Security > Location Services.
     """
+
+    AUTHORIZATION_LABELS = {
+        0: "not determined",
+        1: "restricted",
+        2: "denied",
+        3: "authorized always",
+        4: "authorized in use",
+    }
 
     def __init__(self, parent=None):
         super().__init__()
         self.parent = parent
         self._manager = None
         self._delegate = None
+        self.authorization_status = 0
+
+    def _set_error_from_code(self, code):
+        # kCLErrorLocationUnknown (0) is transient: keep waiting.
+        if code == 0:
+            self.status_message = "Waiting for location fix..."
+            return
+        if code == 1:
+            self.error = (
+                "Location access denied. Enable it in System Settings > "
+                "Privacy & Security > Location Services."
+            )
+            return
+        if code == 2:
+            self.error = "Location unavailable: no network."
+            return
+        self.status_message = "Location error (code {0})".format(code)
 
     def start(self):
         try:
@@ -202,14 +258,31 @@ class CoreLocationGpsProvider(GpsProvider):
                 provider.num_satellites = 0
                 provider.hdop = 0.0
                 provider.last_update = time.time()
+                provider.error = None
+                provider.status_message = None
 
             def locationManager_didFailWithError_(self, manager, error):
-                provider.error = str(error.localizedDescription())
-                logger.warning("CoreLocation error: {0}".format(provider.error))
+                try:
+                    code = int(error.code())
+                except Exception:
+                    code = -1
+                provider._set_error_from_code(code)
+                logger.warning(
+                    "CoreLocation error code {0}: {1}".format(
+                        code, error.localizedDescription()
+                    )
+                )
 
             def locationManagerDidChangeAuthorization_(self, manager):
-                status = manager.authorizationStatus()
-                logger.info("CoreLocation authorization status: {0}".format(status))
+                status = int(manager.authorizationStatus())
+                provider.authorization_status = status
+                logger.info(
+                    "CoreLocation authorization status: {0} ({1})".format(
+                        status, provider.AUTHORIZATION_LABELS.get(status, "?")
+                    )
+                )
+                if status == 0 and hasattr(manager, "requestWhenInUseAuthorization"):
+                    manager.requestWhenInUseAuthorization()
 
         self._delegate = _Delegate.alloc().init()
         self._manager = CoreLocation.CLLocationManager.alloc().init()
@@ -234,31 +307,45 @@ class CoreLocationGpsProvider(GpsProvider):
         super().stop()
 
 
-def create_gps_provider(require_usb: bool = True):
-    """Return the best available GPS provider (USB GNSS preferred).
+def create_gps_provider(source=GPS_SOURCE_AUTO, port: str = None, parent=None):
+    """Create and start a GPS provider.
 
-    With require_usb=False, falls back to the CoreLocation provider. Returns
-    None if no provider could be started.
+    :param source: "auto" (USB preferred, CoreLocation fallback), "usb", "corelocation"
+    :param port: explicit serial port for USB providers (optional)
+    :return: a started GpsProvider or None if none could be started
     """
-    usb = NmeaGpsProvider()
-    if usb.port is not None:
+    if source == GPS_SOURCE_CORELOCATION:
+        return _start_core_location()
+
+    ports = [port] if port else detect_usb_ports()
+    if ports:
+        chosen = port or ports[0]
+        usb = NmeaGpsProvider(port=chosen, parent=parent)
         try:
             usb.open_serial()
             usb.start()
-            logger.info("Using USB GNSS on {0}".format(usb.port))
+            logger.info("Using USB GNSS on {0}".format(chosen))
             return usb
         except Exception as e:
-            logger.warning(
-                "USB GNSS not usable ({0}), falling back to CoreLocation".format(e)
-            )
-    if require_usb:
+            logger.warning("USB GNSS on {0} not usable: {1}".format(chosen, e))
+            if source == GPS_SOURCE_USB:
+                return None
+
+    if source == GPS_SOURCE_USB:
+        return None
+    return _start_core_location()
+
+
+def _start_core_location(parent=None):
+    if not core_location_available():
+        logger.warning("CoreLocation not available")
         return None
     try:
-        cl = CoreLocationGpsProvider()
+        cl = CoreLocationGpsProvider(parent=parent)
         cl.start()
         if cl.error:
             logger.warning("CoreLocation GPS not usable: {0}".format(cl.error))
-            return None
+            return cl  # still return it so the UI can show the reason
         return cl
     except Exception as e:
         logger.warning("CoreLocation GPS init failed: {0}".format(e))

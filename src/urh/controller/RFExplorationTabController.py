@@ -26,7 +26,15 @@ from PyQt6.QtWidgets import (
 )
 
 from urh import settings
-from urh.gps.GpsProvider import create_gps_provider
+from urh.gps.GpsProvider import (
+    GPS_SOURCE_AUTO,
+    GPS_SOURCE_CORELOCATION,
+    GPS_SOURCE_OFF,
+    GPS_SOURCE_USB,
+    core_location_available,
+    create_gps_provider,
+    detect_usb_ports,
+)
 from urh.rfscan.Geolocator import (
     estimate_confidence,
     haversine_m,
@@ -171,6 +179,8 @@ class RFExplorationTabController(QWidget):
         self.ui_btnSampleNow.clicked.connect(self.take_manual_sample)
         self.ui_btnClear.clicked.connect(self.clear_samples)
         self.ui_cbFreqDisplay.currentIndexChanged.connect(self.refresh_map)
+        self.ui_cbGpsSource.currentIndexChanged.connect(self.on_gps_source_changed)
+        self.ui_btnDetectGps.clicked.connect(self.on_detect_gps)
         self.scanner.rssi_updated.connect(self._on_rssi)
         self.scanner.device_error.connect(self._on_device_error)
 
@@ -232,11 +242,22 @@ class RFExplorationTabController(QWidget):
         self.ui_cbFreqDisplay = QComboBox()
         controls.addWidget(self.ui_cbFreqDisplay, 2, 1)
 
+        controls.addWidget(QLabel("GPS source:"), 2, 2)
+        self.ui_cbGpsSource = QComboBox()
+        self.ui_cbGpsSource.addItem("Auto (USB preferred)", GPS_SOURCE_AUTO)
+        self.ui_cbGpsSource.addItem("USB GNSS", GPS_SOURCE_USB)
+        self.ui_cbGpsSource.addItem("macOS location", GPS_SOURCE_CORELOCATION)
+        self.ui_cbGpsSource.addItem("Off", GPS_SOURCE_OFF)
+        controls.addWidget(self.ui_cbGpsSource, 2, 3)
+
+        self.ui_btnDetectGps = QPushButton("Detect")
+        controls.addWidget(self.ui_btnDetectGps, 2, 4)
+
         self.ui_lblGps = QLabel("GPS: searching...")
-        controls.addWidget(self.ui_lblGps, 2, 2, 1, 3)
+        controls.addWidget(self.ui_lblGps, 2, 5, 1, 2)
 
         self.ui_lblLive = QLabel("")
-        controls.addWidget(self.ui_lblLive, 2, 5, 1, 4)
+        controls.addWidget(self.ui_lblLive, 2, 7, 1, 2)
 
         layout.addLayout(controls)
 
@@ -301,30 +322,82 @@ class RFExplorationTabController(QWidget):
         settings.write("rfexplore_auto_sample", self.ui_chkAuto.isChecked())
         settings.write(SAMPLE_SPACING_KEY, self.ui_spinSpacing.value())
         settings.write(DWELL_SECONDS_KEY, self.ui_spinDwell.value())
+        settings.write(
+            "rfexplore_gps_source", self.ui_cbGpsSource.currentData()
+            if self.ui_cbGpsSource.count() else GPS_SOURCE_AUTO
+        )
 
     # ----------------------------------------------------------------- GPS
 
     def _init_gps(self):
+        source = settings.read("rfexplore_gps_source", GPS_SOURCE_AUTO, str)
+        self._apply_gps_source(source)
+
+    def _apply_gps_source(self, source):
+        self._stop_gps()
+        self.gps_provider = None
+        if source == GPS_SOURCE_OFF:
+            self.ui_lblGps.setText("GPS: disabled")
+            self._update_gps_marker()
+            return
         try:
-            self.gps_provider = create_gps_provider(require_usb=False)
+            if source == GPS_SOURCE_CORELOCATION:
+                self.gps_provider = create_gps_provider(source=GPS_SOURCE_CORELOCATION)
+            elif source == GPS_SOURCE_USB:
+                self.gps_provider = create_gps_provider(source=GPS_SOURCE_USB)
+            else:
+                self.gps_provider = create_gps_provider(source=GPS_SOURCE_AUTO)
         except Exception as e:
             logger.error("GPS init failed: {0}".format(e))
             self.gps_provider = None
+        self._update_gps_label()
+        self._update_gps_marker()
+
+    def _stop_gps(self):
+        if self.gps_provider is not None:
+            try:
+                self.gps_provider.stop()
+            except Exception:
+                pass
+            self.gps_provider = None
+
+    def on_gps_source_changed(self):
+        source = self.ui_cbGpsSource.currentData()
+        settings.write("rfexplore_gps_source", source)
+        self._apply_gps_source(source)
+
+    def on_detect_gps(self):
+        ports = detect_usb_ports()
+        summary = []
+        if ports:
+            summary.append("USB GNSS: {0}".format(", ".join(ports)))
+        else:
+            summary.append("USB GNSS: none detected")
+        if core_location_available():
+            summary.append("macOS location: available")
+        else:
+            summary.append("macOS location: not available (PyObjC missing)")
+        self.ui_lblGps.setText("Detected - " + " | ".join(summary))
         self._update_gps_label()
 
     def _gps_summary(self):
         p = self.gps_provider
         if p is None:
-            return "GPS: unavailable"
+            return "GPS: no provider"
         kind = type(p).__name__
-        if p.error:
-            return "GPS ({0}): error - {1}".format(kind, p.error)
         if p.has_fix():
             pos = p.position
             return "GPS ({0}): {1:.6f}, {2:.6f} | fix {3} | sats {4}".format(
                 kind, pos[0], pos[1], p.fix_quality, p.num_satellites
             )
-        return "GPS ({0}): searching for fix...".format(kind)
+        if p.error:
+            return "GPS ({0}): {1}".format(kind, p.error)
+        if p.status_message:
+            return "GPS ({0}): {1}".format(kind, p.status_message)
+        if kind == "CoreLocationGpsProvider":
+            label = p.AUTHORIZATION_LABELS.get(p.authorization_status, "?")
+            return "GPS (CoreLocation): waiting - authorization {0}".format(label)
+        return "GPS ({0}): waiting for fix...".format(kind)
 
     def _update_gps_label(self):
         self.ui_lblGps.setText(self._gps_summary())
@@ -573,10 +646,6 @@ class RFExplorationTabController(QWidget):
 
     def closeEvent(self, event):
         self.stop_scanning()
-        if self.gps_provider is not None:
-            try:
-                self.gps_provider.stop()
-            except Exception:
-                pass
+        self._stop_gps()
         self._save_settings()
         super().closeEvent(event)
