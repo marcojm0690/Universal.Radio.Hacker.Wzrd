@@ -13,6 +13,10 @@ from urh.ui.ui_ai_analysis import Ui_AIAnalysisTab
 from urh.util.Logger import logger
 
 
+LOADED_SUFFIX = " (loaded)"
+MAX_RESPONSE_TOKENS = 4096
+
+
 class LMStudioWorker(QThread):
     """
     Runs the request to the LM Studio server (OpenAI compatible API) in a
@@ -28,7 +32,7 @@ class LMStudioWorker(QThread):
         model: str,
         messages: list,
         temperature=0.2,
-        max_tokens=1500,
+        max_tokens=MAX_RESPONSE_TOKENS,
         parent=None,
     ):
         super().__init__(parent)
@@ -40,6 +44,11 @@ class LMStudioWorker(QThread):
 
     def run(self):
         try:
+            logger.info(
+                "Requesting analysis from model '{0}' at {1}".format(
+                    self.model, self.server_url
+                )
+            )
             payload = json.dumps(
                 {
                     "model": self.model,
@@ -60,10 +69,43 @@ class LMStudioWorker(QThread):
             with urllib.request.urlopen(request, timeout=600) as response:
                 result = json.loads(response.read().decode("utf-8"))
 
-            content = result["choices"][0]["message"]["content"]
+            message = result["choices"][0]["message"]
+            content = message.get("content") or ""
+            reasoning = message.get("reasoning_content") or ""
+            finish_reason = result["choices"][0].get("finish_reason", "")
             model_used = result.get("model", self.model)
+
+            if not content:
+                # Reasoning models put the thinking into "reasoning_content" and
+                # leave "content" empty until the chain of thought is complete.
+                if reasoning:
+                    content = (
+                        "[Thinking]\n{0}\n\n[Answer]\n(no final answer was produced)".format(
+                            reasoning
+                        )
+                    )
+                elif finish_reason == "length":
+                    content = (
+                        "(The model ran out of output tokens before producing an answer. "
+                        "Try a smaller capture or a model with a larger context.)"
+                    )
+                else:
+                    content = "(The model returned an empty response.)"
+
             self.finished_with_result.emit(model_used, content)
-        except (urllib.error.URLError, urllib.error.HTTPError, ConnectionError, TimeoutError) as e:
+            logger.info(
+                "Analysis result from '{0}' (finish_reason={1}, content_len={2}, reasoning_len={3})".format(
+                    model_used, finish_reason, len(content), len(reasoning)
+                )
+            )
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+            except Exception:
+                pass
+            self.failed.emit("{} ({}): {}".format(str(e), e.code, detail or "model not available in LM Studio"))
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
             self.failed.emit(str(e))
         except (KeyError, ValueError, json.JSONDecodeError) as e:
             self.failed.emit("Unexpected response from server: {}".format(e))
@@ -82,6 +124,8 @@ class AIAnalysisTabController(QWidget):
         self.ui.setupUi(self)
 
         self.__worker = None
+        self.__context_lengths = {}
+        self.last_truncation_note = ""
 
         self.captured_data_text = ""
         self.prompt_template = ""
@@ -98,6 +142,8 @@ class AIAnalysisTabController(QWidget):
 
         model = settings.read("ai_model", "", str)
         if model:
+            if model.endswith(LOADED_SUFFIX):
+                model = model[: -len(LOADED_SUFFIX)]
             self.ui.cbModel.setEditable(True)
             self.ui.cbModel.setCurrentText(model)
 
@@ -112,7 +158,8 @@ class AIAnalysisTabController(QWidget):
         self.ui.cbModel.editTextChanged.connect(self.on_model_changed)
 
     def on_model_changed(self, text: str):
-        settings.write("ai_model", text)
+        clean = text[: -len(LOADED_SUFFIX)] if text.endswith(LOADED_SUFFIX) else text
+        settings.write("ai_model", clean.strip())
 
     @property
     def server_url(self) -> str:
@@ -120,7 +167,14 @@ class AIAnalysisTabController(QWidget):
 
     @property
     def selected_model(self) -> str:
-        return self.ui.cbModel.currentText().strip()
+        model = ""
+        if self.ui.cbModel.currentData():
+            model = str(self.ui.cbModel.currentData())
+        else:
+            model = self.ui.cbModel.currentText().strip()
+        if model.endswith(LOADED_SUFFIX):
+            model = model[: -len(LOADED_SUFFIX)]
+        return model
 
     def __set_status(self, text: str, error=False):
         self.ui.lblStatus.setText(text)
@@ -159,17 +213,59 @@ class AIAnalysisTabController(QWidget):
                 "5. Potential attack/analysis surface (replay, fuzzing, stateful simulation) and caveats.\n"
             )
 
-        user_prompt += (
-            "\n\n===== CAPTURED DATA =====\n"
+        user_prompt += "\n\n"
+
+        data_section = (
+            "===== CAPTURED DATA =====\n"
             + (self.captured_data_text or "(no protocol data loaded yet)")
             + "\n===== END OF DATA =====\n\n"
             "Based on the data above, provide your analysis."
         )
 
+        # Estimate token usage: prompt template + wrapped data section.
+        # Conservative heuristic: ~2.5 chars per token (hex/bits compress well).
+        chars_per_token = 2.5
+        context = self.__context_lengths.get(self.selected_model, 8192)
+        prompt_budget = max(512, context - MAX_RESPONSE_TOKENS - 200)
+        budget_chars = int(prompt_budget * chars_per_token)
+
+        self.last_truncation_note = ""
+        data_chars = len(data_section)
+        base_chars = len(user_prompt)
+        if base_chars + data_chars > budget_chars:
+            data_budget = max(0, budget_chars - base_chars)
+            data_section = self.__truncate_data_section(data_section, data_budget)
+            self.last_truncation_note = (
+                "Captured data was truncated to fit the model's {0}-token context "
+                "window. Consider loading a model with a larger context for full captures.".format(
+                    context
+                )
+            )
+
         return [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": user_prompt + data_section},
         ]
+
+    @staticmethod
+    def __truncate_data_section(data_section: str, budget_chars: int) -> str:
+        if len(data_section) <= budget_chars:
+            return data_section
+
+        header = "===== CAPTURED DATA ====="
+        header_end = len(header) + 1  # past the header line
+
+        # Prefer cutting on a message boundary, but fall back to a mid-line cut
+        # so a single long line still yields a large, useful payload.
+        cut = data_section.rfind("\n", header_end, budget_chars)
+        if cut < header_end:
+            cut = budget_chars
+
+        truncated = data_section[:cut].rstrip()
+        omitted = len(data_section) - len(truncated)
+        truncated += "\n\n[... truncated: {0} chars of captured data omitted to fit the model's "
+        truncated += "context window; refresh and re-analyze with a smaller capture if needed ...]"
+        return truncated.format(omitted)
 
     @pyqtSlot()
     def refresh_captured_data(self):
@@ -181,6 +277,20 @@ class AIAnalysisTabController(QWidget):
     def refresh_models(self):
         self.__set_status("Fetching models...")
         try:
+            loaded_models = set()
+            self.__context_lengths = {}
+            try:
+                url = self.server_url + "/api/v0/models"
+                with urllib.request.urlopen(url, timeout=10) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                for m in result.get("data", []):
+                    if m.get("state") == "loaded":
+                        loaded_models.add(m["id"])
+                    if m.get("loaded_context_length"):
+                        self.__context_lengths[m["id"]] = m["loaded_context_length"]
+            except Exception:
+                pass
+
             url = self.server_url + "/v1/models"
             with urllib.request.urlopen(url, timeout=10) as response:
                 result = json.loads(response.read().decode("utf-8"))
@@ -188,9 +298,22 @@ class AIAnalysisTabController(QWidget):
             models = [m["id"] for m in result.get("data", [])]
             self.ui.cbModel.clear()
             self.ui.cbModel.setEditable(True)
-            self.ui.cbModel.addItems(sorted(models))
+            for model in sorted(models):
+                if model in loaded_models:
+                    self.ui.cbModel.addItem(model + LOADED_SUFFIX, userData=model)
+                else:
+                    self.ui.cbModel.addItem(model, userData=model)
+
+            if loaded_models:
+                target = next(iter(sorted(loaded_models)))
+                index = self.ui.cbModel.findData(target)
+                if index >= 0:
+                    self.ui.cbModel.setCurrentIndex(index)
+                else:
+                    self.ui.cbModel.setCurrentText(target)
+
             if models:
-                self.__set_status("{} model(s) found".format(len(models)))
+                self.__set_status("{} model(s) available, {} loaded".format(len(models), len(loaded_models)))
             else:
                 self.__set_status("No models available", error=True)
         except Exception as e:
@@ -208,7 +331,7 @@ class AIAnalysisTabController(QWidget):
             with urllib.request.urlopen(self.server_url + "/v1/models", timeout=5) as response:
                 result = json.loads(response.read().decode("utf-8"))
             num_models = len(result.get("data", []))
-            self.__set_status("Connected ({0} model(s) loaded)".format(num_models))
+            self.__set_status("Connected ({0} model(s) available)".format(num_models))
         except Exception as e:
             self.__set_status("Connection failed", error=True)
             QMessageBox.critical(
@@ -242,7 +365,15 @@ class AIAnalysisTabController(QWidget):
             return
 
         messages = self.__build_payload(mode)
-        self.ui.txtResult.setPlainText("Asking {} ...\n\nThis can take a while for local models.".format(self.selected_model))
+        context = self.__context_lengths.get(self.selected_model, 8192)
+        placeholder = "Asking {} ...\n\nThis can take a while for local models.".format(
+            self.selected_model
+        )
+        if self.last_truncation_note:
+            placeholder = "Asking {} ... (context {})\n\n{}\n".format(
+                self.selected_model, context, self.last_truncation_note
+            )
+        self.ui.txtResult.setPlainText(placeholder)
         self.__set_status("Analyzing...")
 
         self.__worker = LMStudioWorker(

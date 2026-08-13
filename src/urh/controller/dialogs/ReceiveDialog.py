@@ -8,6 +8,7 @@ from urh.dev.VirtualDevice import Mode, VirtualDevice
 from urh.ui.painting.LiveSceneManager import LiveSceneManager
 from urh.util import FileOperator
 from urh.util.Formatter import Formatter
+from urh.util.Logger import logger
 from datetime import datetime
 from urh.signalprocessing.RecordedFile import RecordedFile
 
@@ -104,6 +105,12 @@ class ReceiveDialog(SendRecvDialog):
     @pyqtSlot()
     def on_save_clicked(self):
         data = self.device.data[: self.device.current_index]
+
+        logger.info(
+            "Saving recording: {0} samples (device current_index={1})".format(
+                len(data), self.device.current_index
+            )
+        )
 
         dev = self.device
         big_val = Formatter.big_value_with_suffix

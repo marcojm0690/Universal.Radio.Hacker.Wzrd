@@ -16,6 +16,7 @@ from urh import settings, version
 from urh.controller.AIAnalysisTabController import AIAnalysisTabController
 from urh.controller.CompareFrameController import CompareFrameController
 from urh.controller.GeneratorTabController import GeneratorTabController
+from urh.controller.RFExplorationTabController import RFExplorationTabController
 from urh.controller.SignalTabController import SignalTabController
 from urh.controller.SimulatorTabController import SimulatorTabController
 from urh.controller.dialogs.CSVImportDialog import CSVImportDialog
@@ -85,6 +86,11 @@ class MainController(QMainWindow):
             self.compare_frame_controller, parent=self.ui.tab_ai
         )
         self.ui.tab_ai.layout().addWidget(self.ai_analysis_tab_controller)
+
+        self.rf_exploration_tab_controller = RFExplorationTabController(
+            parent=self.ui.tab_rf
+        )
+        self.ui.tab_rf.layout().addWidget(self.rf_exploration_tab_controller)
 
         self.undo_group = QUndoGroup()
         self.undo_group.addStack(self.signal_tab_controller.signal_undo_stack)
@@ -427,6 +433,15 @@ class MainController(QMainWindow):
 
         signal = Signal(
             filename, sig_name, sample_rate=sample_rate, timestamp=signal_timestamp
+        )
+
+        logger.info(
+            "Loaded signal '{0}': {1} samples @ {2} Sps (file size {3} bytes)".format(
+                sig_name,
+                signal.num_samples,
+                signal.sample_rate,
+                os.path.getsize(filename),
+            )
         )
 
         self.file_proxy_model.open_files.add(filename)

@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RF Exploration Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #1e2226; }
+  #map { height: 100vh; width: 100vw; }
+  .legend {
+    background: rgba(20, 24, 28, 0.88);
+    color: #cfd6dc;
+    font: 12px/1.5 system-ui, sans-serif;
+    padding: 8px 10px;
+    border-radius: 6px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.4);
+  }
+  .legend b { color: #fff; }
+  .legend .row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+  .legend .swatch { width: 14px; height: 14px; border-radius: 50%; border: 1px solid rgba(255,255,255,.25); }
+  .status {
+    background: rgba(20, 24, 28, 0.88);
+    color: #cfd6dc;
+    font: 12px/1.5 system-ui, sans-serif;
+    padding: 8px 10px;
+    border-radius: 6px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.4);
+  }
+  .status b { color: #fff; }
+  .est-popup { font: 12px/1.5 system-ui, sans-serif; }
+  .leaflet-div-icon.est-marker {
+    background: transparent;
+    border: none;
+  }
+  .est-marker .pin {
+    width: 26px; height: 26px;
+    border: 3px solid #e63232;
+    border-radius: 50%;
+    background: rgba(230, 50, 50, 0.25);
+    position: relative;
+  }
+  .est-marker .pin::before, .est-marker .pin::after {
+    content: ""; position: absolute; background: #e63232;
+  }
+  .est-marker .pin::before { left: 50%; top: -7px; width: 3px; height: 40px; transform: translateX(-50%); }
+  .est-marker .pin::after { top: 50%; left: -7px; height: 3px; width: 40px; transform: translateY(-50%); }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  var map = L.map("map", { zoomControl: true }).setView([40.0, -3.0], 12);
+
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).addTo(map);
+
+  var samplesLayer = L.layerGroup().addTo(map);
+  var estimateLayer = L.layerGroup().addTo(map);
+  var gpsLayer = L.layerGroup().addTo(map);
+
+  function rssiColor(rssi) {
+    var t = (Math.max(-120, Math.min(-40, rssi)) + 120) / 80; // 0..1, -120..-40
+    var r = Math.round(60 + 195 * t);
+    var g = Math.round(180 - 180 * t);
+    var b = Math.round(60 + 60 * t);
+    return "rgb(" + r + "," + g + "," + b + ")";
+  }
+
+  function rssiRadius(rssi) {
+    return Math.max(6, Math.min(22, 22 + (rssi + 120) * 0.3));
+  }
+
+  // Keep one marker per sample id, so re-sampling updates in place.
+  var sampleMarkers = {};
+
+  function upsertSamples(samples) {
+    var moved = false;
+    var pts = [];
+    samples.forEach(function (s) {
+      var id = s[0], lat = s[1], lon = s[2], rssi = s[3];
+      if (sampleMarkers[id]) {
+        sampleMarkers[id].setLatLng([lat, lon]);
+        sampleMarkers[id].setStyle({ radius: rssiRadius(rssi), color: rssiColor(rssi), fillColor: rssiColor(rssi) });
+      } else {
+        var m = L.circleMarker([lat, lon], {
+          radius: rssiRadius(rssi),
+          color: rssiColor(rssi),
+          weight: 1,
+          fillColor: rssiColor(rssi),
+          fillOpacity: 0.75
+        });
+        m.bindPopup("<b>RSSI " + rssi.toFixed(1) + " dB</b><br>" + lat.toFixed(6) + ", " + lon.toFixed(6));
+        m.addTo(samplesLayer);
+        sampleMarkers[id] = m;
+        moved = true;
+      }
+      pts.push([lat, lon]);
+    });
+    if (moved && pts.length) {
+      map.fitBounds(L.latLngBounds(pts), { padding: [40, 40], maxZoom: 18 });
+    }
+    var count = Object.keys(sampleMarkers).length;
+    document.getElementById("sample-count").textContent = count;
+  }
+
+  function setEstimate(est) {
+    estimateLayer.clearLayers();
+    if (!est || typeof est.lat !== "number" || typeof est.lon !== "number") return;
+    var icon = L.divIcon({ className: "est-marker", html: '<div class="pin"></div>', iconSize: [26, 26], iconAnchor: [13, 13] });
+    var m = L.marker([est.lat, est.lon], { icon: icon });
+    var conf = est.confidence || "low";
+    var confColor = { high: "#2e9e4f", medium: "#d98f1a", low: "#c94343" }[conf] || "#c94343";
+    m.bindPopup(
+      '<div class="est-popup"><b>Emitter estimate</b><br>' +
+      "Lat: " + est.lat.toFixed(6) + "<br>Lon: " + est.lon.toFixed(6) + "<br>" +
+      "Method: " + (est.method || "?") + "<br>" +
+      "Confidence: <span style='color:" + confColor + ";font-weight:bold'>" + conf + "</span>" +
+      (est.rms ? "<br>RMS: " + est.rms.toFixed(2) + " dB" : "") +
+      (est.p0 ? "<br>P0: " + est.p0.toFixed(1) + " dBm" : "") +
+      (est.n ? "<br>path-loss n: " + est.n.toFixed(2) : "") +
+      "</div>", { closeButton: false });
+    m.addTo(estimateLayer);
+    map.flyTo([est.lat, est.lon], Math.max(map.getZoom(), 17));
+  }
+
+  function setGps(lat, lon, hdop) {
+    gpsLayer.clearLayers();
+    var m = L.circleMarker([lat, lon], {
+      radius: 7,
+      color: "#ffffff",
+      weight: 2,
+      fillColor: "#2f7ff0",
+      fillOpacity: 0.9
+    });
+    m.bindPopup("<b>GPS position</b><br>" + lat.toFixed(6) + ", " + lon.toFixed(6) +
+      (hdop ? "<br>HDOP: " + hdop.toFixed(1) : ""), { closeButton: false });
+    m.addTo(gpsLayer);
+    document.getElementById("gps-status").textContent = "GPS " + lat.toFixed(5) + ", " + lon.toFixed(5);
+  }
+
+  function setGpsStatus(text) {
+    document.getElementById("gps-status").textContent = text;
+  }
+
+  function fitAll() {
+    var all = [];
+    Object.keys(sampleMarkers).forEach(function (id) { all.push(sampleMarkers[id].getLatLng()); });
+    if (all.length) {
+      map.fitBounds(L.latLngBounds(all), { padding: [40, 40] });
+    }
+  }
+
+  function clearAll() {
+    samplesLayer.clearLayers();
+    estimateLayer.clearLayers();
+    sampleMarkers = {};
+    document.getElementById("sample-count").textContent = 0;
+  }
+
+  var api = { upsertSamples: upsertSamples, setEstimate: setEstimate, setGps: setGps, setGpsStatus: setGpsStatus, fitAll: fitAll, clearAll: clearAll };
+
+  // HTML
+  var legend = L.control({ position: "topright" });
+  legend.onAdd = function () {
+    var div = L.DomUtil.create("div", "legend");
+    div.innerHTML =
+      '<b>Signal</b>' +
+      '<div class="row"><span class="swatch" style="background:rgb(255,110,60)"></span>strong (-40 dB)</div>' +
+      '<div class="row"><span class="swatch" style="background:rgb(255,200,60)"></span>medium (-80 dB)</div>' +
+      '<div class="row"><span class="swatch" style="background:rgb(60,180,120)"></span>weak (-120 dB)</div>';
+    return div;
+  };
+  legend.addTo(map);
+
+  var status = L.control({ position: "bottomleft" });
+  status.onAdd = function () {
+    var div = L.DomUtil.create("div", "status");
+    div.innerHTML = '<b>Samples:</b> <span id="sample-count">0</span> &nbsp;|&nbsp; <span id="gps-status">GPS: waiting</span>';
+    return div;
+  };
+  status.addTo(map);
+
+  // Fit control
+  var fitCtrl = L.control({ position: "bottomright" });
+  fitCtrl.onAdd = function () {
+    var b = L.DomUtil.create("a", "leaflet-bar leaflet-control");
+    b.href = "#";
+    b.style.cssText = "width:30px;height:30px;line-height:30px;text-align:center;font-size:18px;font-weight:bold;background:#fff;color:#333";
+    b.innerHTML = "&#9742;";
+    L.DomEvent.on(b, "click", function (e) { L.DomEvent.stop(e); fitAll(); });
+    return b;
+  };
+  fitCtrl.addTo(map);
+
+  // Bridge to Qt (if webchannel is available)
+  if (typeof qt !== "undefined" && qt.webChannelTransport) {
+    new QWebChannel(qt.webChannelTransport, function (channel) {
+      window.rfmap = channel.objects.rfmap;
+      window.rfmap.mapReady();
+      window.onerror = function (msg, src, line, col) {
+        if (window.rfmap) {
+          window.rfmap.reportError(msg + " @" + (src || "?") + ":" + line);
+        }
+        return false;
+      };
+    });
+  }
+
+  map.on("click", function (e) {
+    if (window.rfmap) {
+      window.rfmap.mapClicked(e.latlng.lat, e.latlng.lng);
+    }
+  });
+
+  window.WZRD = api;
+})();
+</script>
+</body>
+</html>

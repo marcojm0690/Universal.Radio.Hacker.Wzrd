@@ -78,6 +78,8 @@ class ProtocolSniffer(ProtocolAnalyzer, QObject):
         self.adaptive_noise = False
         self.automatic_center = False
 
+        self.__noise_floor = None
+
         self.pause_length = 0
         self.is_running = False
 
@@ -169,19 +171,24 @@ class ProtocolSniffer(ProtocolAnalyzer, QObject):
         while self.is_running:
             time.sleep(0.01)
             if self.rcv_device.is_raw_mode:
-                if old_index <= self.rcv_device.current_index:
-                    data = self.rcv_device.data[
-                        old_index : self.rcv_device.current_index
-                    ]
-                else:
-                    data = np.concatenate(
-                        (
-                            self.rcv_device.data[old_index:],
-                            self.rcv_device.data[: self.rcv_device.current_index],
+                data = self.rcv_device.data
+                if data is None:
+                    # receive buffer not allocated yet (device still starting up)
+                    continue
+                try:
+                    if old_index <= self.rcv_device.current_index:
+                        chunk = data[old_index : self.rcv_device.current_index]
+                    else:
+                        chunk = np.concatenate(
+                            (
+                                data[old_index:],
+                                data[: self.rcv_device.current_index],
+                            )
                         )
-                    )
+                except (TypeError, ValueError):
+                    continue
                 old_index = self.rcv_device.current_index
-                self.__demodulate_data(data)
+                self.__demodulate_data(chunk)
             elif self.rcv_device.backend == Backends.network:
                 # We receive the bits here
                 for bit_str in self.rcv_device.data:
@@ -211,7 +218,29 @@ class ProtocolSniffer(ProtocolAnalyzer, QObject):
             return
 
         power_spectrum = data.real**2.0 + data.imag**2.0
-        is_above_noise = np.sqrt(np.mean(power_spectrum)) > self.signal.noise_threshold
+        chunk_rms = float(np.sqrt(np.mean(power_spectrum)))
+
+        # Track the quietest received chunk as the noise floor.
+        if self.__noise_floor is None or chunk_rms < self.__noise_floor:
+            self.__noise_floor = chunk_rms
+
+        # Auto-calibrate the noise threshold when the configured value (relative *
+        # max_magnitude, which for the empty LiveSignal is relative * sqrt(2)) sits
+        # below the actual noise floor. Otherwise everything reads as "signal" and
+        # no pauses/messages are ever detected.
+        configured_threshold = self.signal.noise_threshold_relative * self.signal.max_magnitude
+        if self.__noise_floor is not None and configured_threshold < self.__noise_floor:
+            self.signal.noise_threshold = 3.0 * self.__noise_floor
+            logger.info(
+                "Sniffer: auto-calibrated noise threshold to {0:.6f} "
+                "(noise floor {1:.6f}, configured was {2:.6f})".format(
+                    self.signal.noise_threshold,
+                    self.__noise_floor,
+                    configured_threshold,
+                )
+            )
+
+        is_above_noise = chunk_rms > self.signal.noise_threshold
 
         if self.adaptive_noise and not is_above_noise:
             self.signal.noise_threshold = (

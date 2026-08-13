@@ -110,6 +110,11 @@ class Signal(QObject):
 
     def __load_complex_file(self, filename: str):
         self.iq_array = IQArray.from_file(filename)
+        logger.info(
+            "Loaded {0} samples from complex file {1}".format(
+                len(self.iq_array), filename
+            )
+        )
 
     def __load_wav_file(self, filename: str):
         wav = wave.open(filename, "r")

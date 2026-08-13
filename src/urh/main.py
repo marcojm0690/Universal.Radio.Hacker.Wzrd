@@ -128,6 +128,14 @@ def main():
     if settings.read("theme_index", 0, int) > 0:
         os.environ["QT_QPA_PLATFORMTHEME"] = "fusion"
 
+    try:
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtWebEngineWidgets import QWebEngineView
+
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
+    except ImportError:
+        pass
+
     app = QApplication(["WZRD6"] + sys.argv[1:])
     app.setWindowIcon(QIcon(":/icons/icons/appicon.png"))
 

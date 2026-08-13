@@ -806,6 +806,15 @@ class Device(object):
                 if self.__first_data_timestamp == 0:
                     self.__first_data_timestamp = time.time()
                     calculating_timestamp = True
+                    logger.info(
+                        "First data received ({0} bytes, ~{1} samples)".format(
+                            len(byte_buffer),
+                            len(byte_buffer)
+                            // 8
+                            if self.DATA_TYPE == np.float32
+                            else len(byte_buffer),
+                        )
+                    )
                 else:
                     calculating_timestamp = False
 
@@ -848,6 +857,11 @@ class Device(object):
             ] = samples[:n_samples]
             self.current_recv_index += n_samples
 
+        logger.info(
+            "Ended receiving: {0} samples captured (buffer index {1}, is_receiving={2})".format(
+                self.current_recv_index, self.current_recv_index, self.is_receiving
+            )
+        )
         logger.debug("Exiting read_receive_queue thread.")
 
     def init_send_parameters(
