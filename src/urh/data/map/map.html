@@ -67,6 +67,11 @@
   var estimateLayer = L.layerGroup().addTo(map);
   var gpsLayer = L.layerGroup().addTo(map);
 
+  // GPS always stays centered; only skip estimate fly-to once the user interacts.
+  var userMoved = false;
+  map.on("dragstart zoomstart", function () { userMoved = true; });
+  map.on("click", function () { userMoved = true; });
+
   function rssiColor(rssi) {
     var t = (Math.max(-120, Math.min(-40, rssi)) + 120) / 80; // 0..1, -120..-40
     var r = Math.round(60 + 195 * t);
@@ -81,10 +86,15 @@
 
   // Keep one marker per sample id, so re-sampling updates in place.
   var sampleMarkers = {};
+  var lastEstLat = null, lastEstLon = null;
+
+  // GPS breadcrumb trail.
+  var gpsTrailLayer = L.layerGroup().addTo(map);
+  var gpsTrailPoints = [];
+  var gpsPoly = null;
+  var lastGps = null;
 
   function upsertSamples(samples) {
-    var moved = false;
-    var pts = [];
     samples.forEach(function (s) {
       var id = s[0], lat = s[1], lon = s[2], rssi = s[3];
       if (sampleMarkers[id]) {
@@ -101,13 +111,8 @@
         m.bindPopup("<b>RSSI " + rssi.toFixed(1) + " dB</b><br>" + lat.toFixed(6) + ", " + lon.toFixed(6));
         m.addTo(samplesLayer);
         sampleMarkers[id] = m;
-        moved = true;
       }
-      pts.push([lat, lon]);
     });
-    if (moved && pts.length) {
-      map.fitBounds(L.latLngBounds(pts), { padding: [40, 40], maxZoom: 18 });
-    }
     var count = Object.keys(sampleMarkers).length;
     document.getElementById("sample-count").textContent = count;
   }
@@ -129,10 +134,37 @@
       (est.n ? "<br>path-loss n: " + est.n.toFixed(2) : "") +
       "</div>", { closeButton: false });
     m.addTo(estimateLayer);
-    map.flyTo([est.lat, est.lon], Math.max(map.getZoom(), 17));
+    if (!userMoved && (typeof lastEstLat !== "number" || Math.abs(lastEstLat - est.lat) > 1e-5 || Math.abs(lastEstLon - est.lon) > 1e-5)) {
+      map.flyTo([est.lat, est.lon], Math.max(map.getZoom(), 17));
+    }
+    lastEstLat = est.lat;
+    lastEstLon = est.lon;
   }
 
   function setGps(lat, lon, hdop) {
+    // Follow: center the map on the live position so it stays visible.
+    map.setView([lat, lon], Math.max(map.getZoom(), 16));
+
+    // Breadcrumb trail: drop a faded mark where we were before moving.
+    if (lastGps && (Math.abs(lastGps[0] - lat) > 4e-5 || Math.abs(lastGps[1] - lon) > 4e-5)) {
+      gpsTrailPoints.push(lastGps);
+      L.circleMarker(lastGps, {
+        radius: 3,
+        color: "#777",
+        weight: 1,
+        fillColor: "#999",
+        fillOpacity: 0.6
+      }).addTo(gpsTrailLayer)
+        .bindPopup("<b>Previous GPS</b><br>" + lastGps[0].toFixed(6) + ", " + lastGps[1].toFixed(6));
+      if (gpsPoly) gpsPoly.remove();
+      gpsPoly = L.polyline(gpsTrailPoints.concat([[lat, lon]]), {
+        color: "#2f7ff0",
+        weight: 2,
+        dashArray: "4,4"
+      }).addTo(gpsTrailLayer);
+    }
+    lastGps = [lat, lon];
+
     gpsLayer.clearLayers();
     var m = L.circleMarker([lat, lon], {
       radius: 7,
@@ -162,6 +194,11 @@
   function clearAll() {
     samplesLayer.clearLayers();
     estimateLayer.clearLayers();
+    gpsLayer.clearLayers();
+    gpsTrailLayer.clearLayers();
+    gpsTrailPoints = [];
+    gpsPoly = null;
+    lastGps = null;
     sampleMarkers = {};
     document.getElementById("sample-count").textContent = 0;
   }

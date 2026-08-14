@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
+    QMessageBox,
 )
 
 from urh import settings
@@ -42,6 +43,8 @@ from urh.rfscan.Geolocator import (
     weighted_centroid,
 )
 from urh.rfscan.RssiScanner import RssiScanner
+from urh.rfscan.SignalAnalysisDialog import SignalAnalysisDialog
+from urh.rfscan.SignalAnalyzer import analyze_signal, peaks_summary
 from urh.util.Logger import logger
 
 MAP_FILE = os.path.abspath(
@@ -50,6 +53,12 @@ MAP_FILE = os.path.abspath(
 
 SAMPLE_SPACING_KEY = "rfexplore_spacing"
 DWELL_SECONDS_KEY = "rfexplore_dwell"
+CSV_ENABLED_KEY = "rfexplore_csv_log"
+CSV_DIR = os.path.expanduser(os.path.join("~", ".config", "urh", "rfexplore_logs"))
+CSV_HEADER = (
+    "date,time,freq_mhz,lat,lon,rssi_db,n_peaks,top_freq_mhz,bandwidth_khz,"
+    "noise_floor_db,summary"
+)
 
 
 class MapBridge(QObject):
@@ -82,7 +91,7 @@ class RfSampleWorker(QObject):
     signal.
     """
 
-    sample_ready = pyqtSignal(float, float, float, float)  # freq_hz, lat, lon, rssi
+    sample_ready = pyqtSignal(float, float, float, float, object)  # freq, lat, lon, rssi, analysis
 
     def __init__(self, scanner: RssiScanner, gps_provider, frequencies, parent=None):
         super().__init__(parent)
@@ -92,6 +101,7 @@ class RfSampleWorker(QObject):
         self.spacing_m = 6.0
         self.dwell_s = 10.0
         self._running = False
+        self._cancelled = False
         self._last_pos = None
         self._last_sample_time = 0.0
         self._thread = None
@@ -104,6 +114,7 @@ class RfSampleWorker(QObject):
         if self._thread is not None and self._thread.is_alive():
             return
         self._running = True
+        self._cancelled = False
         self._last_pos = None
         self._last_sample_time = 0.0
         self._thread = threading.Thread(target=self.run, daemon=True)
@@ -111,6 +122,7 @@ class RfSampleWorker(QObject):
 
     def stop(self):
         self._running = False
+        self._cancelled = True
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(3.0)
         self._thread = None
@@ -143,17 +155,61 @@ class RfSampleWorker(QObject):
                 time.sleep(1.0)
 
     def take_samples(self, pos):
-        """Measure RSSI at every frequency (may block; call off the GUI thread)."""
+        """Measure RSSI at every frequency (may block; call off the GUI thread).
+
+        Retuning a streaming RTL-SDR on macOS wedges the R82xx tuner
+        (r82xx_read: i2c wr failed), so the device is reopened per frequency.
+        """
         lat, lon = pos[0], pos[1]
         for freq in self.frequencies:
+            if self._cancelled:
+                break
             try:
-                self.scanner.set_frequency(freq)
-                self.scanner.clear_history()
-                time.sleep(0.4)
-                rssi = self.scanner.average_rssi(0.6)
-                self.sample_ready.emit(freq, lat, lon, rssi)
+                self._open_at(freq)
+                attempts = 0
+                while (
+                    not self.scanner.data_received
+                    and attempts < 3
+                    and not self._cancelled
+                ):
+                    logger.warning(
+                        "RfSampleWorker: no IQ data at {0:.3f} MHz, reopening".format(
+                            freq / 1e6
+                        )
+                    )
+                    time.sleep(1.0)
+                    self._open_at(freq)
+                    attempts += 1
+                rssi = self.scanner.average_rssi(0.8)
+                analysis = None
+                if self.scanner.data_received:
+                    snap = self.scanner.snapshot(2 ** 16)
+                    if snap is not None:
+                        try:
+                            analysis = analyze_signal(
+                                snap, freq, self.scanner.sample_rate
+                            )
+                        except Exception as e:
+                            logger.error(
+                                "Signal analysis failed at {0:.3f} MHz: {1}".format(
+                                    freq / 1e6, e
+                                )
+                            )
+                self.sample_ready.emit(freq, lat, lon, rssi, analysis)
             except Exception as e:
                 logger.error("RfSampleWorker sample error: {0}".format(e))
+
+    def _open_at(self, freq):
+        if self.scanner.is_running:
+            self.scanner.stop()
+            time.sleep(0.3)
+        self.scanner.start(
+            freq,
+            self.scanner.sample_rate,
+            self.scanner.gain,
+            device_number=self.scanner.device_number,
+        )
+        time.sleep(0.8)
 
 
 class RFExplorationTabController(QWidget):
@@ -169,8 +225,11 @@ class RFExplorationTabController(QWidget):
         self.bridge = None
         self.ui_map_view = None
         self._map_ready = False
+        self._devices = []
+        self._csv_file = None
 
         self._build_ui()
+        self._refresh_devices()
         self._load_settings()
         self._init_gps()
         self._init_map()
@@ -178,9 +237,13 @@ class RFExplorationTabController(QWidget):
         self.ui_btnStartStop.clicked.connect(self.on_start_stop)
         self.ui_btnSampleNow.clicked.connect(self.take_manual_sample)
         self.ui_btnClear.clicked.connect(self.clear_samples)
+        self.ui_btnFitMap.clicked.connect(self.fit_map)
         self.ui_cbFreqDisplay.currentIndexChanged.connect(self.refresh_map)
         self.ui_cbGpsSource.currentIndexChanged.connect(self.on_gps_source_changed)
         self.ui_btnDetectGps.clicked.connect(self.on_detect_gps)
+        self.ui_btnRefreshDevice.clicked.connect(self._refresh_devices)
+        self.ui_btnOpenLog.clicked.connect(self.open_csv_log)
+        self.ui_table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         self.scanner.rssi_updated.connect(self._on_rssi)
         self.scanner.device_error.connect(self._on_device_error)
 
@@ -220,6 +283,9 @@ class RFExplorationTabController(QWidget):
 
         self.ui_btnClear = QPushButton("Clear")
         controls.addWidget(self.ui_btnClear, 0, 8)
+
+        self.ui_btnFitMap = QPushButton("Fit map")
+        controls.addWidget(self.ui_btnFitMap, 0, 9)
 
         self.ui_chkAuto = QCheckBox("Auto-sample while moving")
         self.ui_chkAuto.setChecked(True)
@@ -265,6 +331,11 @@ class RFExplorationTabController(QWidget):
         self.ui_lblLive = QLabel("")
         controls.addWidget(self.ui_lblLive, 2, 7, 1, 2)
 
+        self.ui_chkCsv = QCheckBox("Log to CSV")
+        controls.addWidget(self.ui_chkCsv, 3, 0, 1, 2)
+        self.ui_btnOpenLog = QPushButton("Open log")
+        controls.addWidget(self.ui_btnOpenLog, 3, 2)
+
         layout.addLayout(controls)
 
         splitter = QSplitter()
@@ -296,8 +367,10 @@ class RFExplorationTabController(QWidget):
         form.addRow("Confidence:", self.ui_lblConfidence)
         bottom.addWidget(estimate_group)
 
-        self.ui_table = QTableWidget(0, 5)
-        self.ui_table.setHorizontalHeaderLabels(["Freq (MHz)", "Lat", "Lon", "RSSI", "Time"])
+        self.ui_table = QTableWidget(0, 7)
+        self.ui_table.setHorizontalHeaderLabels(
+            ["Freq (MHz)", "Lat", "Lon", "RSSI", "Date", "Time", "Analysis"]
+        )
         self.ui_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         bottom.addWidget(self.ui_table)
         bottom.setSizes([300, 600])
@@ -320,6 +393,11 @@ class RFExplorationTabController(QWidget):
         self.ui_chkAuto.setChecked(settings.read("rfexplore_auto_sample", True, bool))
         self.ui_spinSpacing.setValue(settings.read(SAMPLE_SPACING_KEY, 6.0, float))
         self.ui_spinDwell.setValue(settings.read(DWELL_SECONDS_KEY, 10, int))
+        self.ui_chkCsv.setChecked(settings.read(CSV_ENABLED_KEY, False, bool))
+        saved_device = settings.read("rfexplore_sdr_device", -1, int)
+        didx = self.ui_cbDevice.findData(saved_device)
+        if didx >= 0:
+            self.ui_cbDevice.setCurrentIndex(didx)
 
     def _save_settings(self):
         settings.write("rfexplore_frequencies", self.ui_edtFreq.text().strip())
@@ -328,9 +406,32 @@ class RFExplorationTabController(QWidget):
         settings.write("rfexplore_auto_sample", self.ui_chkAuto.isChecked())
         settings.write(SAMPLE_SPACING_KEY, self.ui_spinSpacing.value())
         settings.write(DWELL_SECONDS_KEY, self.ui_spinDwell.value())
+        settings.write(CSV_ENABLED_KEY, self.ui_chkCsv.isChecked())
         settings.write(
             "rfexplore_gps_source", self.ui_cbGpsSource.currentData()
             if self.ui_cbGpsSource.count() else GPS_SOURCE_AUTO
+        )
+        if self.ui_cbDevice.currentData() is not None:
+            settings.write("rfexplore_sdr_device", self.ui_cbDevice.currentData())
+
+    # --------------------------------------------------------------- Device
+
+    def _refresh_devices(self):
+        devices = RssiScanner.detect_devices()
+        self._devices = devices
+        self.ui_cbDevice.blockSignals(True)
+        self.ui_cbDevice.clear()
+        for info in devices:
+            self.ui_cbDevice.addItem(RssiScanner.device_label(info), info["index"])
+        if not devices:
+            self.ui_cbDevice.addItem("No RTL-SDR detected")
+        self.ui_cbDevice.blockSignals(False)
+        saved_device = settings.read("rfexplore_sdr_device", -1, int)
+        didx = self.ui_cbDevice.findData(saved_device)
+        if didx >= 0:
+            self.ui_cbDevice.setCurrentIndex(didx)
+        logger.info(
+            "RTL-SDR devices: {0} detected".format(len(devices))
         )
 
     # ----------------------------------------------------------------- GPS
@@ -418,6 +519,7 @@ class RFExplorationTabController(QWidget):
             and self.ui_map_view is not None
         ):
             lat, lon = p.position[0], p.position[1]
+            logger.info("GPS pos: {0:.6f}, {1:.6f}".format(lat, lon))
             self._run_js(
                 "WZRD.setGps({0}, {1}, {2});".format(repr(lat), repr(lon), repr(p.hdop))
             )
@@ -515,9 +617,19 @@ class RFExplorationTabController(QWidget):
             return
         srate = self.ui_cbSampleRate.currentData()
         gain = self.ui_spinGain.value()
+        device_number = self.ui_cbDevice.currentData()
+        if device_number is None or not self._devices:
+            QMessageBox.warning(
+                self,
+                "No RTL-SDR detected",
+                "No RTL-SDR device is currently visible to macOS.\n\n"
+                "Please check the USB connection (unplug and re-plug the dongle)\n"
+                "and click Refresh.",
+            )
+            return
 
         self.ui_btnStartStop.setEnabled(False)
-        self.scanner.start(freqs[0], srate, gain)
+        self.scanner.start(freqs[0], srate, gain, device_number=device_number)
         self.ui_btnStartStop.setEnabled(True)
         self.ui_btnStartStop.setText("Stop")
 
@@ -556,16 +668,30 @@ class RFExplorationTabController(QWidget):
         )
         t.start()
 
-    def _on_sample(self, freq, lat, lon, rssi):
+    def _on_sample(self, freq, lat, lon, rssi, analysis):
+        dt = datetime.fromtimestamp(time.time())
         sample = {
             "freq": freq,
             "lat": lat,
             "lon": lon,
             "rssi": rssi,
-            "ts": time.time(),
+            "ts": dt.timestamp(),
+            "date_str": dt.strftime("%Y-%m-%d"),
+            "time_str": dt.strftime("%H:%M:%S"),
+            "analysis": analysis,
         }
         self.samples.append(sample)
+        logger.info(
+            "Sample: {0:.3f} MHz @ {1:.6f}, {2:.6f} rssi={3:.1f} {4}".format(
+                freq / 1e6,
+                lat,
+                lon,
+                rssi,
+                peaks_summary(analysis) if analysis is not None else "",
+            )
+        )
         self._append_table_row(sample)
+        self._write_csv(sample)
         self._refresh_freq_display()
         self.refresh_map()
 
@@ -576,19 +702,92 @@ class RFExplorationTabController(QWidget):
         self.ui_table.setItem(row, 1, QTableWidgetItem("{0:.6f}".format(s["lat"])))
         self.ui_table.setItem(row, 2, QTableWidgetItem("{0:.6f}".format(s["lon"])))
         self.ui_table.setItem(row, 3, QTableWidgetItem("{0:.1f}".format(s["rssi"])))
+        self.ui_table.setItem(row, 4, QTableWidgetItem(s["date_str"]))
+        self.ui_table.setItem(row, 5, QTableWidgetItem(s["time_str"]))
         self.ui_table.setItem(
             row,
-            4,
-            QTableWidgetItem(datetime.fromtimestamp(s["ts"]).strftime("%H:%M:%S")),
+            6,
+            QTableWidgetItem(peaks_summary(s["analysis"]) if s["analysis"] is not None else "-"),
         )
         if self.ui_table.rowCount() > 500:
             self.ui_table.removeRow(0)
+
+    def _on_cell_double_clicked(self, row, _column):
+        if row < len(self.samples):
+            self._open_analysis(self.samples[row])
+
+    def _open_analysis(self, sample):
+        dialog = SignalAnalysisDialog(sample, sample.get("analysis"), parent=self)
+        dialog.exec()
+
+    # ------------------------------------------------------------------- CSV
+
+    def _csv_path(self):
+        if self._csv_file is None:
+            os.makedirs(CSV_DIR, exist_ok=True)
+            self._csv_file = os.path.join(
+                CSV_DIR,
+                "RF_{0}.csv".format(datetime.now().strftime("%Y-%m-%d_%H-%M-%S")),
+            )
+            with open(self._csv_file, "w") as f:
+                f.write(CSV_HEADER + "\n")
+            logger.info("CSV log started: {0}".format(self._csv_file))
+        return self._csv_file
+
+    def _write_csv(self, s):
+        if not self.ui_chkCsv.isChecked():
+            return
+        try:
+            a = s["analysis"]
+            if a is not None and a.get("peaks"):
+                top = a["peaks"][0]
+                n_peaks = a.get("n_peaks", 0)
+                top_freq = top["freq_mhz"]
+                bw = a.get("bandwidth_hz", 0.0) / 1e3
+                floor = a.get("noise_floor_db", 0.0)
+                summary = peaks_summary(a)
+            else:
+                n_peaks = 0
+                top_freq = 0.0
+                bw = 0.0
+                floor = 0.0
+                summary = "no peaks"
+            line = "{0},{1},{2:.3f},{3:.6f},{4:.6f},{5:.1f},{6},{7:.5f},{8:.1f},{9:.1f},{10}".format(
+                s["date_str"],
+                s["time_str"],
+                s["freq"] / 1e6,
+                s["lat"],
+                s["lon"],
+                s["rssi"],
+                n_peaks,
+                top_freq,
+                bw,
+                floor,
+                summary,
+            )
+            with open(self._csv_path(), "a") as f:
+                f.write(line + "\n")
+        except Exception as e:
+            logger.error("CSV write failed: {0}".format(e))
+
+    def open_csv_log(self):
+        import subprocess
+
+        if self._csv_file is None:
+            os.makedirs(CSV_DIR, exist_ok=True)
+            path = CSV_DIR
+        else:
+            path = self._csv_file
+        subprocess.Popen(["open", "-R", path])
 
     def clear_samples(self):
         self.samples.clear()
         self.ui_table.setRowCount(0)
         self._refresh_freq_display()
         self.refresh_map()
+
+    def fit_map(self):
+        self._run_js("WZRD.fitAll();")
 
     # ------------------------------------------------------------- display
 
@@ -597,7 +796,7 @@ class RFExplorationTabController(QWidget):
 
     def _on_device_error(self, msg):
         logger.error("RF scanner error: {0}".format(msg))
-        self.ui_lblGps.setText("Scanner error: {0}".format(msg))
+        self.ui_lblLive.setText("Scanner error: {0}".format(msg))
 
     def _filtered_samples(self):
         filt = self._current_filter_freq()

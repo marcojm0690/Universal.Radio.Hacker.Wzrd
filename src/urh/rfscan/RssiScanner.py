@@ -31,9 +31,62 @@ class RssiScanner(QObject):
         self.frequency = None
         self.sample_rate = None
         self.gain = None
+        self.device_number = 0
         self.last_rssi = -200.0
+        self.data_received = False
+        self._last_chunk = None
         self._rssi_history = deque(maxlen=400)
         self._history_lock = threading.Lock()
+
+    @staticmethod
+    def detect_devices():
+        """Return a list of dicts describing each connected RTL-SDR dongle."""
+        devices = []
+        try:
+            from urh.dev.native.lib import rtlsdr
+
+            count = int(rtlsdr.get_device_count())
+            serials = rtlsdr.get_device_list() or []
+            for index in range(count):
+                name = ""
+                manufacturer = ""
+                product = ""
+                serial = ""
+                try:
+                    name = str(rtlsdr.get_device_name(index))
+                except Exception:
+                    pass
+                try:
+                    manufacturer, product, serial = rtlsdr.get_device_usb_strings(index)
+                    manufacturer = manufacturer or ""
+                    product = product or ""
+                    serial = serial or ""
+                except Exception:
+                    pass
+                if not serial and index < len(serials):
+                    serial = serials[index] or ""
+                devices.append(
+                    {
+                        "index": index,
+                        "name": name,
+                        "manufacturer": manufacturer,
+                        "product": product,
+                        "serial": serial,
+                    }
+                )
+        except Exception as e:
+            logger.warning("RssiScanner: RTL-SDR detection failed: {0}".format(e))
+        return devices
+
+    @staticmethod
+    def device_label(info: dict) -> str:
+        parts = [p for p in (info.get("manufacturer"), info.get("product")) if p]
+        label = " ".join(parts) if parts else (info.get("name") or "RTL-SDR")
+        if info.get("serial"):
+            label += " (#{0})".format(info["serial"])
+        else:
+            label += " (#{0})".format(info.get("index", 0))
+        return label
 
     def clear_history(self):
         with self._history_lock:
@@ -50,6 +103,13 @@ class RssiScanner(QObject):
                 return self.last_rssi
             return float(np.mean(recent))
 
+    def snapshot(self, n: int = 2 ** 14) -> np.ndarray:
+        """Return a copy of the most recent (N, 2) int8 IQ window, or None."""
+        with self._history_lock:
+            if self._last_chunk is None:
+                return None
+            return self._last_chunk[-n:].copy()
+
     @property
     def is_running(self) -> bool:
         return self._running
@@ -64,13 +124,15 @@ class RssiScanner(QObject):
                 logger.error("RssiScanner: retune failed: {0}".format(e))
                 self.device_error.emit(str(e))
 
-    def start(self, frequency: float, sample_rate: int, gain: int):
+    def start(self, frequency: float, sample_rate: int, gain: int, device_number: int = 0):
         if self._running:
             return
         self.frequency = frequency
         self.sample_rate = sample_rate
         self.gain = gain
+        self.device_number = int(device_number)
         self._old_index = 0
+        self.data_received = False
 
         self.device = VirtualDevice(
             self.backend_handler,
@@ -82,14 +144,16 @@ class RssiScanner(QObject):
             resume_on_full_receive_buffer=True,
             raw_mode=True,
         )
+        if device_number:
+            self.device.device_number = int(device_number)
         self.device.start()
         self._running = True
         self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._read_thread.start()
         self.state_changed.emit(True)
         logger.info(
-            "RssiScanner: started at {0} Hz, {1} Sps, gain {2}".format(
-                frequency, sample_rate, gain
+            "RssiScanner: started device #{0} at {1} Hz, {2} Sps, gain {3}".format(
+                device_number, frequency, sample_rate, gain
             )
         )
 
@@ -126,10 +190,15 @@ class RssiScanner(QObject):
                 self._old_index = current
 
                 if len(chunk) > 0:
+                    self.data_received = True
                     rssi = self._compute_rssi(chunk)
                     with self._history_lock:
                         self.last_rssi = rssi
                         self._rssi_history.append((time.time(), rssi))
+                        if self._last_chunk is None or len(self._last_chunk) < 2 ** 16:
+                            self._last_chunk = chunk.copy()
+                        else:
+                            self._last_chunk = np.concatenate((self._last_chunk[chunk.shape[0] :], chunk))
                     self.rssi_updated.emit(rssi, time.time())
             except Exception as e:
                 logger.error("RssiScanner read error: {0}".format(e))
