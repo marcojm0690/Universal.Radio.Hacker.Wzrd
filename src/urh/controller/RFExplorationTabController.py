@@ -41,6 +41,7 @@ from urh.rfscan.Geolocator import (
     trilaterate,
     weighted_centroid,
 )
+from urh.rfscan.FoxHuntDialog import FoxHuntDialog
 from urh.rfscan.RssiScanner import RssiScanner
 from urh.rfscan.SignalAnalysisDialog import SignalAnalysisDialog
 from urh.rfscan.SignalAnalyzer import analyze_signal, peaks_summary
@@ -182,12 +183,21 @@ class RfSampleWorker(QObject):
                 rssi = self.scanner.average_rssi(0.8)
                 analysis = None
                 if self.scanner.data_received:
-                    snap = self.scanner.snapshot(2 ** 16)
+                    snap = self.scanner.snapshot(2 ** 18)
                     if snap is not None:
                         try:
                             analysis = analyze_signal(
-                                snap, freq, self.scanner.sample_rate
+                                snap,
+                                freq,
+                                self.scanner.sample_rate,
+                                fft_averages=4,
                             )
+                            signal_rssi = analysis.get("signal_rssi_db")
+                            if signal_rssi is not None:
+                                # Narrowband RSSI of the dominant peak: excludes
+                                # broadband noise so it scales with the emitter's
+                                # distance instead of reading the noise floor.
+                                rssi = signal_rssi
                         except Exception as e:
                             logger.error(
                                 "Signal analysis failed at {0:.3f} MHz: {1}".format(
@@ -236,6 +246,7 @@ class RFExplorationTabController(QWidget):
         self._map_ready = False
         self._devices = []
         self._csv_file = None
+        self._fox_hunt_dialog = None
 
         self._build_ui()
         self._refresh_devices()
@@ -252,6 +263,7 @@ class RFExplorationTabController(QWidget):
         self.ui_btnDetectGps.clicked.connect(self.on_detect_gps)
         self.ui_btnRefreshDevice.clicked.connect(self._refresh_devices)
         self.ui_btnOpenLog.clicked.connect(self.open_csv_log)
+        self.ui_btnFoxHunt.clicked.connect(self.open_fox_hunt)
         self.ui_table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         self.scanner.rssi_updated.connect(self._on_rssi)
         self.scanner.device_error.connect(self._on_device_error)
@@ -355,6 +367,13 @@ class RFExplorationTabController(QWidget):
         controls.addWidget(self.ui_chkCsv, 3, 0, 1, 2)
         self.ui_btnOpenLog = QPushButton("Open log")
         controls.addWidget(self.ui_btnOpenLog, 3, 2)
+
+        self.ui_btnFoxHunt = QPushButton("Fox-hunt")
+        self.ui_btnFoxHunt.setToolTip(
+            "Open the fox-hunting dashboard: bearing radar, emitter bearing/distance,\n"
+            "and forensic report export."
+        )
+        controls.addWidget(self.ui_btnFoxHunt, 3, 3)
 
         layout.addLayout(controls)
 
@@ -740,6 +759,14 @@ class RFExplorationTabController(QWidget):
         dialog = SignalAnalysisDialog(sample, sample.get("analysis"), parent=self)
         dialog.exec()
 
+    def open_fox_hunt(self):
+        if self._fox_hunt_dialog is None or not self._fox_hunt_dialog.isVisible():
+            self._fox_hunt_dialog = FoxHuntDialog(self, parent=self)
+            self._fox_hunt_dialog.show()
+        else:
+            self._fox_hunt_dialog.raise_()
+            self._fox_hunt_dialog.activateWindow()
+
     # ------------------------------------------------------------------- CSV
 
     def _csv_path(self):
@@ -833,14 +860,16 @@ class RFExplorationTabController(QWidget):
 
         est = self._estimate()
         if est is not None:
+            conf = estimate_confidence(est[4])
             est_js = {
                 "lat": est[0],
                 "lon": est[1],
                 "p0": est[2],
                 "n": est[3],
                 "rms": est[4],
-                "confidence": estimate_confidence(est[4]),
+                "confidence": conf,
                 "method": "trilateration",
+                "radius_m": {"high": 20, "medium": 80, "low": 300}.get(conf, 300),
             }
             self._run_js("WZRD.setEstimate({0});".format(json.dumps(est_js)))
             self.ui_lblTrilat.setText("{0:.6f}, {1:.6f}".format(est[0], est[1]))

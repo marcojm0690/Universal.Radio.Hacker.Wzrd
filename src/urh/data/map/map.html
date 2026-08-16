@@ -36,17 +36,18 @@
     border: none;
   }
   .est-marker .pin {
-    width: 26px; height: 26px;
-    border: 3px solid #e63232;
+    width: 36px; height: 36px;
+    border: 5px solid #ff3030;
     border-radius: 50%;
-    background: rgba(230, 50, 50, 0.25);
+    background: rgba(255, 30, 30, 0.30);
+    box-shadow: 0 0 12px rgba(255, 40, 40, 0.9);
     position: relative;
   }
   .est-marker .pin::before, .est-marker .pin::after {
-    content: ""; position: absolute; background: #e63232;
+    content: ""; position: absolute; background: #ff3030;
   }
-  .est-marker .pin::before { left: 50%; top: -7px; width: 3px; height: 40px; transform: translateX(-50%); }
-  .est-marker .pin::after { top: 50%; left: -7px; height: 3px; width: 40px; transform: translateY(-50%); }
+  .est-marker .pin::before { left: 50%; top: -10px; width: 4px; height: 56px; transform: translateX(-50%); }
+  .est-marker .pin::after { top: 50%; left: -10px; height: 4px; width: 56px; transform: translateY(-50%); }
 </style>
 </head>
 <body>
@@ -73,7 +74,9 @@
   map.on("click", function () { userMoved = true; });
 
   function rssiColor(rssi) {
-    var t = (Math.max(-120, Math.min(-40, rssi)) + 120) / 80; // 0..1, -120..-40
+    // RSSI is mean ADC power on a dB scale: noise ~ +14, full scale ~ +42,
+    // far narrowband signals well below 0. Span -80..40 covers it all.
+    var t = (Math.max(-80, Math.min(40, rssi)) + 80) / 120; // 0..1, -80..40
     var r = Math.round(60 + 195 * t);
     var g = Math.round(180 - 180 * t);
     var b = Math.round(60 + 60 * t);
@@ -81,7 +84,8 @@
   }
 
   function rssiRadius(rssi) {
-    return Math.max(6, Math.min(22, 22 + (rssi + 120) * 0.3));
+    var c = Math.max(-80, Math.min(40, rssi)) + 80;
+    return Math.max(6, Math.min(22, 6 + c * 0.2));
   }
 
   // Keep one marker per sample id, so re-sampling updates in place.
@@ -128,10 +132,34 @@
   function setEstimate(est) {
     estimateLayer.clearLayers();
     if (!est || typeof est.lat !== "number" || typeof est.lon !== "number") return;
-    var icon = L.divIcon({ className: "est-marker", html: '<div class="pin"></div>', iconSize: [26, 26], iconAnchor: [13, 13] });
+    var icon = L.divIcon({ className: "est-marker", html: '<div class="pin"></div>', iconSize: [36, 36], iconAnchor: [18, 18] });
     var m = L.marker([est.lat, est.lon], { icon: icon });
     var conf = est.confidence || "low";
     var confColor = { high: "#2e9e4f", medium: "#d98f1a", low: "#c94343" }[conf] || "#c94343";
+    if (est.radius_m > 0) {
+      L.circle([est.lat, est.lon], {
+        radius: est.radius_m,
+        color: confColor,
+        weight: 1,
+        dashArray: "4,4",
+        fillColor: confColor,
+        fillOpacity: 0.10
+      }).addTo(estimateLayer);
+    }
+    // Direction arrow from the receiver's last known position to the emitter.
+    if (lastGps && (Math.abs(lastGps[0] - est.lat) > 1e-7 || Math.abs(lastGps[1] - est.lon) > 1e-7)) {
+      var arrowLine = L.polyline([[lastGps[0], lastGps[1]], [est.lat, est.lon]], {
+        color: "#ff3030", weight: 2, dashArray: "6,5", opacity: 0.85
+      }).addTo(estimateLayer);
+      // Small arrowhead pointing toward the emitter.
+      var brg = map.project([lastGps[0], lastGps[1]]).angleTo(map.project([est.lat, est.lon]));
+      var tip = map.project([est.lat, est.lon]);
+      var back = tip.add(L.point(-Math.cos(brg) * 14, -Math.sin(brg) * 14));
+      var left = back.add(L.point(Math.cos(brg + 2.5) * 9, Math.sin(brg + 2.5) * 9));
+      var right = back.add(L.point(Math.cos(brg - 2.5) * 9, Math.sin(brg - 2.5) * 9));
+      L.polygon([tip, left, right], { color: "#ff3030", weight: 1, fillColor: "#ff3030", fillOpacity: 0.9 })
+        .addTo(estimateLayer);
+    }
     m.bindPopup(
       '<div class="est-popup"><b>Emitter estimate</b><br>' +
       "Lat: " + est.lat.toFixed(6) + "<br>Lon: " + est.lon.toFixed(6) + "<br>" +
@@ -144,6 +172,7 @@
     m.addTo(estimateLayer);
     if (!userMoved && (typeof lastEstLat !== "number" || Math.abs(lastEstLat - est.lat) > 1e-5 || Math.abs(lastEstLon - est.lon) > 1e-5)) {
       map.flyTo([est.lat, est.lon], Math.max(map.getZoom(), 17));
+      m.openPopup();
     }
     lastEstLat = est.lat;
     lastEstLon = est.lon;

@@ -103,7 +103,7 @@ class RssiScanner(QObject):
                 return self.last_rssi
             return float(np.mean(recent))
 
-    def snapshot(self, n: int = 2 ** 14) -> np.ndarray:
+    def snapshot(self, n: int = 2 ** 18) -> np.ndarray:
         """Return a copy of the most recent (N, 2) int8 IQ window, or None."""
         with self._history_lock:
             if self._last_chunk is None:
@@ -195,10 +195,11 @@ class RssiScanner(QObject):
                     with self._history_lock:
                         self.last_rssi = rssi
                         self._rssi_history.append((time.time(), rssi))
-                        if self._last_chunk is None or len(self._last_chunk) < 2 ** 16:
+                        max_keep = 2 ** 18
+                        if self._last_chunk is None or len(self._last_chunk) < max_keep:
                             self._last_chunk = chunk.copy()
                         else:
-                            self._last_chunk = np.concatenate((self._last_chunk[chunk.shape[0] :], chunk))
+                            self._last_chunk = np.concatenate((self._last_chunk[chunk.shape[0]:], chunk))
                     self.rssi_updated.emit(rssi, time.time())
             except Exception as e:
                 logger.error("RssiScanner read error: {0}".format(e))
