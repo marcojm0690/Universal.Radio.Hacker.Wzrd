@@ -95,6 +95,7 @@
   var lastGps = null;
 
   function upsertSamples(samples) {
+    var addedNew = false;
     samples.forEach(function (s) {
       var id = s[0], lat = s[1], lon = s[2], rssi = s[3];
       if (sampleMarkers[id]) {
@@ -111,8 +112,15 @@
         m.bindPopup("<b>RSSI " + rssi.toFixed(1) + " dB</b><br>" + lat.toFixed(6) + ", " + lon.toFixed(6));
         m.addTo(samplesLayer);
         sampleMarkers[id] = m;
+        addedNew = true;
       }
     });
+    // Show the whole survey area (including far-away samples) until the user
+    // takes over the map with their own drag/zoom.
+    if (addedNew && !userMoved && Object.keys(sampleMarkers).length > 0) {
+      var bounds = Object.keys(sampleMarkers).map(function (id) { return sampleMarkers[id].getLatLng(); });
+      map.fitBounds(L.latLngBounds(bounds), { padding: [40, 40], maxZoom: 18 });
+    }
     var count = Object.keys(sampleMarkers).length;
     document.getElementById("sample-count").textContent = count;
   }
@@ -142,8 +150,12 @@
   }
 
   function setGps(lat, lon, hdop) {
-    // Follow: center the map on the live position so it stays visible.
-    map.setView([lat, lon], Math.max(map.getZoom(), 16));
+    // Only position the view from GPS before any samples exist; once samples
+    // are on the map the view is driven by the samples/estimate so far-away
+    // ones stay visible.
+    if (Object.keys(sampleMarkers).length === 0) {
+      map.setView([lat, lon], Math.max(map.getZoom(), 16));
+    }
 
     // Breadcrumb trail: drop a faded mark where we were before moving.
     if (lastGps && (Math.abs(lastGps[0] - lat) > 4e-5 || Math.abs(lastGps[1] - lon) > 4e-5)) {

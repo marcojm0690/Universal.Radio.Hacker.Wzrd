@@ -15,7 +15,6 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHeaderView,
     QLabel,
-    QLineEdit,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -214,6 +213,16 @@ class RfSampleWorker(QObject):
 
 class RFExplorationTabController(QWidget):
     DEFAULT_FREQUENCIES = "433.920, 868.000, 915.000"
+    FREQUENCY_PRESETS = [
+        "433.920, 868.000, 915.000",
+        "433.920",
+        "868.000",
+        "915.000",
+        "315.000",
+        "403.000",
+        "868.000, 915.000",
+        "2400.000",
+    ]
     SAMPLE_RATES = [250000, 1000000, 2048000]
 
     def __init__(self, parent=None):
@@ -259,9 +268,15 @@ class RFExplorationTabController(QWidget):
 
         controls = QGridLayout()
         controls.addWidget(QLabel("Frequencies (MHz):"), 0, 0)
-        self.ui_edtFreq = QLineEdit()
-        self.ui_edtFreq.setPlaceholderText("e.g. 433.920, 868.000")
-        controls.addWidget(self.ui_edtFreq, 0, 1)
+        self.ui_cbFreq = QComboBox()
+        self.ui_cbFreq.setEditable(True)
+        self.ui_cbFreq.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.ui_cbFreq.addItems(self.FREQUENCY_PRESETS)
+        self.ui_cbFreq.setToolTip(
+            "Pick a frequency preset, or type your own comma-separated list "
+            "in MHz (e.g. 433.920, 868.000)."
+        )
+        controls.addWidget(self.ui_cbFreq, 0, 1)
 
         controls.addWidget(QLabel("Sample rate:"), 0, 2)
         self.ui_cbSampleRate = QComboBox()
@@ -269,10 +284,15 @@ class RFExplorationTabController(QWidget):
             self.ui_cbSampleRate.addItem("{0:.3f} MS/s".format(sr / 1e6), sr)
         controls.addWidget(self.ui_cbSampleRate, 0, 3)
 
-        controls.addWidget(QLabel("Gain (x0.1 dB):"), 0, 4)
+        controls.addWidget(QLabel("Gain (0.1 dB):"), 0, 4)
         self.ui_spinGain = QSpinBox()
-        self.ui_spinGain.setRange(0, 99)
-        self.ui_spinGain.setValue(20)
+        self.ui_spinGain.setRange(0, 500)
+        self.ui_spinGain.setValue(300)
+        self.ui_spinGain.setToolTip(
+            "RTL-SDR gain in 0.1 dB steps (e.g. 300 = 30.0 dB). Max is ~49.6 dB.\n"
+            "Raise it to pick up weak / far-away signals; back off if strong\n"
+            "near-field signals saturate (clipping) the 8-bit ADC."
+        )
         controls.addWidget(self.ui_spinGain, 0, 5)
 
         self.ui_btnStartStop = QPushButton("Start")
@@ -383,13 +403,13 @@ class RFExplorationTabController(QWidget):
     # ------------------------------------------------------------ settings
 
     def _load_settings(self):
-        self.ui_edtFreq.setText(
+        self.ui_cbFreq.setCurrentText(
             settings.read("rfexplore_frequencies", self.DEFAULT_FREQUENCIES, str)
         )
         srate = settings.read("rfexplore_sample_rate", 1000000, int)
         idx = self.ui_cbSampleRate.findData(srate)
         self.ui_cbSampleRate.setCurrentIndex(max(0, idx))
-        self.ui_spinGain.setValue(settings.read("rfexplore_gain", 20, int))
+        self.ui_spinGain.setValue(settings.read("rfexplore_gain", 300, int))
         self.ui_chkAuto.setChecked(settings.read("rfexplore_auto_sample", True, bool))
         self.ui_spinSpacing.setValue(settings.read(SAMPLE_SPACING_KEY, 6.0, float))
         self.ui_spinDwell.setValue(settings.read(DWELL_SECONDS_KEY, 10, int))
@@ -400,7 +420,7 @@ class RFExplorationTabController(QWidget):
             self.ui_cbDevice.setCurrentIndex(didx)
 
     def _save_settings(self):
-        settings.write("rfexplore_frequencies", self.ui_edtFreq.text().strip())
+        settings.write("rfexplore_frequencies", self.ui_cbFreq.currentText().strip())
         settings.write("rfexplore_sample_rate", self.ui_cbSampleRate.currentData())
         settings.write("rfexplore_gain", self.ui_spinGain.value())
         settings.write("rfexplore_auto_sample", self.ui_chkAuto.isChecked())
@@ -573,7 +593,7 @@ class RFExplorationTabController(QWidget):
     # ------------------------------------------------------------ scanning
 
     def _frequencies(self):
-        raw = self.ui_edtFreq.text().strip()
+        raw = self.ui_cbFreq.currentText().strip()
         freqs = []
         for part in raw.split(","):
             part = part.strip()
