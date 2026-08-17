@@ -4,6 +4,8 @@ import threading
 import time
 from datetime import datetime
 
+import numpy as np
+
 from PyQt6.QtCore import QObject, Qt, QTimer, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -55,6 +57,7 @@ SAMPLE_SPACING_KEY = "rfexplore_spacing"
 DWELL_SECONDS_KEY = "rfexplore_dwell"
 CSV_ENABLED_KEY = "rfexplore_csv_log"
 CSV_DIR = os.path.expanduser(os.path.join("~", ".config", "urh", "rfexplore_logs"))
+CAPTURE_DIR = os.path.join(CSV_DIR, "bursts")
 CSV_HEADER = (
     "date,time,freq_mhz,lat,lon,rssi_db,n_peaks,top_freq_mhz,bandwidth_khz,"
     "noise_floor_db,summary"
@@ -235,8 +238,11 @@ class RFExplorationTabController(QWidget):
     ]
     SAMPLE_RATES = [250000, 1000000, 2048000]
 
-    def __init__(self, parent=None):
+    burst_captured = pyqtSignal(str, float)  # path, sample_rate
+
+    def __init__(self, main_controller=None, parent=None):
         super().__init__(parent)
+        self.main_controller = main_controller
         self.samples = []  # list of dicts: freq, lat, lon, rssi, ts
         self.scanner = RssiScanner(parent=self)
         self.gps_provider = None
@@ -267,6 +273,7 @@ class RFExplorationTabController(QWidget):
         self.ui_table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         self.scanner.rssi_updated.connect(self._on_rssi)
         self.scanner.device_error.connect(self._on_device_error)
+        self.burst_captured.connect(self._on_burst_captured)
 
         self.gps_timer = QTimer(self)
         self.gps_timer.setInterval(3000)
@@ -756,8 +763,98 @@ class RFExplorationTabController(QWidget):
             self._open_analysis(self.samples[row])
 
     def _open_analysis(self, sample):
-        dialog = SignalAnalysisDialog(sample, sample.get("analysis"), parent=self)
+        dialog = SignalAnalysisDialog(
+            sample,
+            sample.get("analysis"),
+            parent=self,
+            capture_cb=lambda: self.start_burst_capture(sample),
+        )
+        self.burst_captured.connect(dialog.on_burst_captured)
         dialog.exec()
+        try:
+            self.burst_captured.disconnect(dialog.on_burst_captured)
+        except (TypeError, RuntimeError):
+            pass
+
+    # ------------------------------------------------------ burst capture
+
+    def start_burst_capture(self, sample):
+        """Capture a continuous IQ burst at this sample's frequency.
+
+        Retunes the SDR (pausing any active scan), records ~1 s of IQ, saves
+        it as a URH-compatible .complex16s file and opens it in the Analysis
+        tab for time-domain / spectrum / demodulator work. Runs off-thread.
+        """
+        freq = float(sample["freq"])
+        srate = self.scanner.sample_rate or self.ui_cbSampleRate.currentData()
+        gain = (
+            self.scanner.gain
+            if self.scanner.gain is not None
+            else self.ui_spinGain.value()
+        )
+        device_number = self.scanner.device_number
+        threading.Thread(
+            target=self._capture_burst_worker,
+            args=(freq, srate, gain, device_number),
+            daemon=True,
+        ).start()
+
+    def _capture_burst_worker(self, freq, srate, gain, device_number):
+        was_scanning = (
+            self.worker is not None
+            and self.worker._thread is not None
+            and self.worker._thread.is_alive()
+        )
+        try:
+            if was_scanning:
+                self.worker.stop()
+            if self.scanner.is_running:
+                self.scanner.stop()
+            self.scanner.start(freq, srate, gain, device_number=device_number)
+
+            deadline = time.time() + 6.0
+            while not self.scanner.data_received and time.time() < deadline:
+                time.sleep(0.2)
+            time.sleep(1.5)  # let the rolling buffer fill with a fresh window
+
+            snap = self.scanner.snapshot(2 ** 18)
+            self.scanner.stop()
+
+            if snap is None or len(snap) < 1024:
+                logger.error("Burst capture: no IQ data at {0:.3f} MHz".format(freq / 1e6))
+                self.burst_captured.emit("", 0.0)
+                return
+
+            os.makedirs(CAPTURE_DIR, exist_ok=True)
+            path = os.path.join(
+                CAPTURE_DIR,
+                "burst_{0:.3f}MHz_{1}.complex16s".format(
+                    freq / 1e6, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                ),
+            )
+            snap.astype(np.int8).tofile(path)
+            logger.info(
+                "Burst captured: {0} samples @ {1} Hz -> {2}".format(
+                    len(snap), srate, path
+                )
+            )
+            self.burst_captured.emit(path, float(srate))
+        except Exception as e:
+            logger.error("Burst capture failed: {0}".format(e))
+            self.burst_captured.emit("", 0.0)
+        finally:
+            if was_scanning:
+                self.worker.start()
+
+    @pyqtSlot(str, float)
+    def _on_burst_captured(self, path, sample_rate):
+        if path and self.main_controller is not None:
+            self.main_controller.add_signalfile(
+                path, enforce_sample_rate=sample_rate
+            )
+            self.main_controller.ui.tabWidget.setCurrentWidget(
+                self.main_controller.ui.tab_interpretation
+            )
 
     def open_fox_hunt(self):
         if self._fox_hunt_dialog is None or not self._fox_hunt_dialog.isVisible():

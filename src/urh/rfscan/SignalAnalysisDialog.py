@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QTableWidget,
@@ -113,10 +114,11 @@ class SignalAnalysisDialog(QDialog):
 
     ai_result = pyqtSignal(str, bool)
 
-    def __init__(self, sample, analysis, parent=None):
+    def __init__(self, sample, analysis, parent=None, capture_cb=None):
         super().__init__(parent)
         self.sample = sample
         self.analysis = analysis
+        self._capture_cb = capture_cb
         self.setWindowTitle(
             "Signal dissection - {0:.3f} MHz".format(sample["freq"] / 1e6)
         )
@@ -201,12 +203,49 @@ class SignalAnalysisDialog(QDialog):
 
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
+        if self._capture_cb is not None:
+            self.ui_btn_burst = QPushButton("Capture burst & analyze in URH")
+            self.ui_btn_burst.setToolTip(
+                "Retune the SDR to this frequency, record a continuous IQ burst "
+                "(~1 s), save it as a URH .complex16s file and open it in the "
+                "Analysis tab for time-domain, spectrum and demodulator work."
+            )
+            self.ui_btn_burst.clicked.connect(self._on_capture_clicked)
+            btn_row.addWidget(self.ui_btn_burst)
         btn_close = QPushButton("Close")
         btn_close.clicked.connect(self.accept)
         btn_row.addWidget(btn_close)
         layout.addLayout(btn_row)
 
         self.ui_peaks.setFocus()
+
+    # --------------------------------------------------- burst capture
+
+    def _on_capture_clicked(self):
+        self.ui_btn_burst.setEnabled(False)
+        self.ui_btn_burst.setText("Capturing burst ...")
+        try:
+            self._capture_cb()
+        except Exception as e:
+            logger.error("Burst capture start failed: {0}".format(e))
+            self.on_burst_captured("", 0.0)
+
+    def on_burst_captured(self, path, sample_rate):
+        self.ui_btn_burst.setEnabled(True)
+        self.ui_btn_burst.setText("Capture burst & analyze in URH")
+        if path:
+            logger.info(
+                "Burst opened in URH Analysis tab: {0} @ {1:.0f} Hz".format(
+                    path, sample_rate
+                )
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "Burst capture failed",
+                "No IQ data was captured. Check the RTL-SDR connection "
+                "(unplug and re-plug the dongle) and try again.",
+            )
 
     # ------------------------------------------------------------- AI analysis
 

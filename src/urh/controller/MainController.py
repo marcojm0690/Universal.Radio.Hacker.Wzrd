@@ -88,7 +88,7 @@ class MainController(QMainWindow):
         self.ui.tab_ai.layout().addWidget(self.ai_analysis_tab_controller)
 
         self.rf_exploration_tab_controller = RFExplorationTabController(
-            parent=self.ui.tab_rf
+            main_controller=self, parent=self.ui.tab_rf
         )
         self.ui.tab_rf.layout().addWidget(self.rf_exploration_tab_controller)
 
