@@ -138,6 +138,8 @@ class _Canvas(QWidget):
         self._active = []
         self._bursts = collections.deque(maxlen=BURST_HISTORY_MAX)
         self._hover = QPoint(-1, -1)
+        self._last_tip = None
+        self._last_hx = -999
         self._pixmap = None
         self._dbg_calls = 0
         self._dbg_rows = 0
@@ -611,9 +613,15 @@ class _Canvas(QWidget):
                 self._clamp_zoom()
                 self._pan_x0 = e.position().x()
         hit = self._hit_burst(self._hover)
-        self.setToolTip("{0}\n{1}".format(hit.get("label", ""), hit.get("detail", ""))
-                        if hit else "")
-        self.update()
+        tip = ("{0}\n{1}".format(hit.get("label", ""), hit.get("detail", ""))
+               if hit else "")
+        if tip != self._last_tip:
+            self.setToolTip(tip)
+            self._last_tip = tip
+            self.update()
+        elif self._hover.x() != getattr(self, "_last_hx", -999):
+            self.update()
+        self._last_hx = self._hover.x()
 
     def mouseReleaseEvent(self, e):
         self._pan_x0 = None

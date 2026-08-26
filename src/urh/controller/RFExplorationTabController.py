@@ -1,3 +1,4 @@
+import collections
 import json
 import os
 import threading
@@ -248,6 +249,7 @@ class RFExplorationTabController(QWidget):
     _monitor_open_done = pyqtSignal(bool)
     _scan_open_done = pyqtSignal(bool)
     _tuned = pyqtSignal(float)   # retune finished (worker thread -> GUI)
+    _burst_kind_done = pyqtSignal(object)  # bg DSP finished -> refresh row
 
     def __init__(self, main_controller=None, parent=None):
         super().__init__(parent)
@@ -273,6 +275,10 @@ class RFExplorationTabController(QWidget):
         self._harvest_bytes = 0
         self.HARVEST_MAX_BYTES = 500 * 1024 * 1024
         self._pinned = []          # recent bursts with stashed IQ
+        self._bg_q = collections.deque()
+        self._bg_evt = threading.Event()
+        self._bg_thread = threading.Thread(target=self._bg_worker, daemon=True)
+        self._bg_thread.start()
 
         self._build_ui()
         self._refresh_devices()
@@ -301,6 +307,7 @@ class RFExplorationTabController(QWidget):
         self._monitor_open_done.connect(self._on_monitor_open_done)
         self._scan_open_done.connect(self._on_scan_open_done)
         self._tuned.connect(self._on_tuned)
+        self._burst_kind_done.connect(self._refresh_burst_row)
 
         self.gps_timer = QTimer(self)
         self.gps_timer.setInterval(3000)
@@ -1031,13 +1038,9 @@ class RFExplorationTabController(QWidget):
         if self.ui_table.rowCount() > 500:
             self.ui_table.removeRow(0)
 
-    def _infer_burst_kind(self, burst):
-        """Cheap local inference from the buffered IQ: pulse structure +
+    def _infer_burst_kind(self, iq, sr):
+        """Cheap local inference from IQ: pulse structure +
         amplitude-vs-frequency behaviour -> human-readable hint."""
-        try:
-            iq, sr = self.waterfall.extract_burst_iq(burst)
-        except Exception:
-            return ""
         if iq is None or iq.size < 4096 or sr <= 0:
             return ""
         x = np.asarray(iq, dtype=np.complex64)
@@ -1081,15 +1084,13 @@ class RFExplorationTabController(QWidget):
         row = self.ui_table.rowCount()
         self.ui_table.insertRow(row)
         band = (b.get("label", "burst").split("  ", 1) + ["burst"])[1]
-        kind = self._infer_burst_kind(b)
-        b["detail"] = "{0} · ~{1:.0f} kHz · SNR {2:.0f} dB".format(
+        b["detail"] = "{0} \u00b7 ~{1:.0f} kHz \u00b7 SNR {2:.0f} dB \u00b7 analyzing\u2026".format(
             band, b.get("bw", 0.0) / 1e3, b.get("snr", 0.0))
-        if kind:
-            b["detail"] += " · " + kind
         vals = [b.get("time_str", ""), b.get("fc", 0.0) / 1e6, "Burst",
                 b["detail"], "-"]
-        self._pin_burst_iq(b)
-        self._harvest_burst(b)
+        # heavy IQ snapshot + optional disk write happen off the GUI thread
+        self._bg_q.append(b)
+        self._bg_evt.set()
         for cidx, v in enumerate(vals):
             it = QTableWidgetItem("{0:.4f}".format(v) if cidx == 1 else str(v))
             if cidx == 1:
@@ -1259,16 +1260,44 @@ class RFExplorationTabController(QWidget):
                 bw / WF_COLS * (self.waterfall.sample_rate / 1e3)))
         return " · ".join(parts)
 
+    def _bg_worker(self):
+        """Off-GUI-thread burst processing: IQ snapshot + optional harvest.
+
+        extract_burst_iq can memcpy tens of MB and save_iq writes to disk;
+        doing that per finalized burst on the GUI thread froze the app.
+        """
+        while True:
+            if not self._bg_q:
+                self._bg_evt.wait(0.5)
+                self._bg_evt.clear()
+                continue
+            try:
+                b = self._bg_q.popleft()
+            except IndexError:
+                continue
+            try:
+                self._pin_burst_iq(b)
+                if b.get("_iq") is not None:
+                    kind = self._infer_burst_kind(b["_iq"], b.get("_iq_sr", 0.0))
+                    b["detail"] = b["detail"].replace(
+                        " · analyzing\u2026", (" \u00b7 " + kind) if kind else "")
+                    self._burst_kind_done.emit(b)
+                self._harvest_burst(b)
+            except Exception:
+                logger.exception("burst background work failed")
+
     def _pin_burst_iq(self, b):
         """Snapshot the burst IQ at finalize time (ring only keeps ~10 s)."""
-        if b.get("_iq") is not None:
+        if b.get("_iq") is not None or threading.current_thread() is not self._bg_thread:
             return
         try:
             iq, sr = self.waterfall.extract_burst_iq(b)
             if iq is None or iq.size < 4096:
                 return
-            if iq.size > 4_000_000:
-                iq = iq[:4_000_000]
+            if iq.size > 800_000:
+                mid = iq.size // 2
+                half = 400_000
+                iq = iq[mid - half:mid + half]
             b["_iq"] = np.asarray(iq, dtype=np.complex64)
             b["_iq_sr"] = float(sr)
             self._pinned.append(b)
@@ -1279,10 +1308,16 @@ class RFExplorationTabController(QWidget):
             pass
 
     def _denoise_waterfall_burst(self, burst, open_result=True, origin=""):
+        if burst.get("_iq") is None:
+            # not pinned yet (bg thread may still be working) -> try ring now
+            iq, sr = self.waterfall.extract_burst_iq(burst)
+            if iq is not None and iq.size >= 4096:
+                burst["_iq"] = np.asarray(iq[:800_000], dtype=np.complex64)
+                burst["_iq_sr"] = float(sr)
         if burst.get("_iq") is not None:
             iq, sr = burst["_iq"], burst.get("_iq_sr", 0.0)
         else:
-            iq, sr = self.waterfall.extract_burst_iq(burst)
+            iq, sr = None, 0.0
         if iq is None or iq.size < 4096:
             QMessageBox.information(self, "RadioLLM",
                                     "Not enough buffered IQ for that burst yet.\n"
