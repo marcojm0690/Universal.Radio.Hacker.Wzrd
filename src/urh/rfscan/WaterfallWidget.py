@@ -5,7 +5,7 @@ import collections
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QRectF
 from PyQt6.QtGui import QImage, QPainter, QColor, QFont, QPen, QBrush, QPixmap, QPainterPath, QLinearGradient
-from PyQt6.QtWidgets import QWidget, QComboBox, QDoubleSpinBox, QCheckBox, QPushButton, QHBoxLayout, QVBoxLayout, QLabel
+from PyQt6.QtWidgets import QWidget, QComboBox, QDoubleSpinBox, QCheckBox, QPushButton, QHBoxLayout, QVBoxLayout, QLabel, QMenu
 
 FFT_SIZE = 1024
 FFT_STEP = 512
@@ -515,7 +515,10 @@ class _Canvas(QWidget):
         t_span = max(t_new - t_old, 1e-6)
 
         def ty(t):
-            return r.bottom() - ((t_new - t) / t_span) * r.height()
+            frac = (t_new - t) / t_span
+            if self.flip_rows:
+                return r.top() + frac * r.height()
+            return r.bottom() - frac * r.height()
 
         t1 = b.get("t1")
         if t1 is None:
@@ -620,6 +623,34 @@ class _Canvas(QWidget):
         self._pan_x0 = None
         self.update()
 
+    def contextMenuEvent(self, e):
+        menu = QMenu(self)
+        r = self._wf_rect()
+        act_tune = None
+        if r.contains(e.pos()):
+            col_f = self._x_to_col(e.position().x(), r) / COLS
+            f = self.center_freq - self.sample_rate / 2 + col_f * self.sample_rate
+            act_tune = menu.addAction(
+                "Tune here \u2192 {0:.4f} MHz".format(f / 1e6))
+            menu.addSeparator()
+        act_flip = menu.addAction("Newest on top")
+        act_flip.setCheckable(True)
+        act_flip.setChecked(self.flip_rows)
+        act_reset = menu.addAction("Reset zoom")
+        chosen = menu.exec(e.globalPos())
+        if chosen is None:
+            return
+        if act_tune is not None and chosen == act_tune:
+            col_f = self._x_to_col(e.position().x(), r) / COLS
+            f = self.center_freq - self.sample_rate / 2 + col_f * self.sample_rate
+            self.tune_requested.emit(float(f))
+        elif chosen == act_flip:
+            self.flip_rows = not self.flip_rows
+            self._render()
+        elif chosen == act_reset:
+            self.zx0, self.zx1 = 0.0, 1.0
+            self.update()
+
     def _hit_burst(self, pt):
         r = self._wf_rect()
         for b in reversed(list(self._bursts)):
@@ -639,6 +670,7 @@ class WaterfallWidget(QWidget):
 
     burst_selected = pyqtSignal(dict)
     burst_finalized = pyqtSignal(dict)
+    tune_requested = pyqtSignal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -672,8 +704,17 @@ class WaterfallWidget(QWidget):
         self.ui_auto.setToolTip("Track the noise floor automatically")
         self.ui_reset_zoom = QPushButton("Reset zoom")
         self.ui_reset_zoom.setToolTip("Restore the full span (or double-click the waterfall)")
+        self.ui_flip = QCheckBox("Newest on top")
+        self.ui_flip.setToolTip("Flip the waterfall so the newest data appears at the top")
+        self.ui_record = QCheckBox("Record bursts")
+        self.ui_record.setToolTip(
+            "Auto-save every finalized burst (.complex16s + manifest.jsonl) "
+            "for RadioLLM fine-tuning")
+        hint = QLabel("wheel=zoom \u00b7 drag=pan \u00b7 dbl-click=reset \u00b7 right-click=tune")
+        hint.setStyleSheet("color: #6b7280; font-size: 10px;")
         for wdg in (QLabel("Floor:"), self.ui_floor, QLabel("Range:"),
-                    self.ui_range, self.ui_auto, self.ui_reset_zoom):
+                    self.ui_range, self.ui_auto, self.ui_reset_zoom,
+                    self.ui_flip, self.ui_record, hint):
             ctl.addWidget(wdg, 0)
         ctl.addStretch(1)
         lay.addLayout(ctl)
@@ -682,6 +723,7 @@ class WaterfallWidget(QWidget):
         self.canvas = _Canvas()
         self.canvas.burst_selected.connect(self.burst_selected)
         self.canvas.burst_finalized.connect(self.burst_finalized)
+        self.canvas.tune_requested.connect(self.tune_requested)
         lay.addWidget(self.canvas, 1)
 
         self.ui_palette.currentTextChanged.connect(self._on_palette)
@@ -689,6 +731,7 @@ class WaterfallWidget(QWidget):
         self.ui_floor.valueChanged.connect(self._on_manual_scale)
         self.ui_range.valueChanged.connect(self._on_manual_scale)
         self.ui_reset_zoom.clicked.connect(self._reset_zoom)
+        self.ui_flip.toggled.connect(self._on_flip)
 
     # ------------------------------------------------------ delegated API
     # Everything the controller touches lives here and forwards to canvas.
@@ -758,3 +801,7 @@ class WaterfallWidget(QWidget):
     def _reset_zoom(self):
         self.canvas.zx0, self.canvas.zx1 = 0.0, 1.0
         self.canvas.update()
+
+    def _on_flip(self, on):
+        self.canvas.flip_rows = bool(on)
+        self.canvas._render()

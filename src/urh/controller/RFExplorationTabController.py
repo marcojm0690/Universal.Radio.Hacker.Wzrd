@@ -247,6 +247,7 @@ class RFExplorationTabController(QWidget):
     _live_msg = pyqtSignal(str)  # thread-safe ui_lblLive updates
     _monitor_open_done = pyqtSignal(bool)
     _scan_open_done = pyqtSignal(bool)
+    _tuned = pyqtSignal(float)   # retune finished (worker thread -> GUI)
 
     def __init__(self, main_controller=None, parent=None):
         super().__init__(parent)
@@ -266,6 +267,12 @@ class RFExplorationTabController(QWidget):
         self._open_fail_streak = 0
         self._dongle_dead = False
         self._last_reopen_ts = 0.0
+
+        # burst harvesting (Record bursts -> fine-tune dataset)
+        self._recording = False
+        self._harvest_bytes = 0
+        self.HARVEST_MAX_BYTES = 500 * 1024 * 1024
+        self._pinned = []          # recent bursts with stashed IQ
 
         self._build_ui()
         self._refresh_devices()
@@ -293,6 +300,7 @@ class RFExplorationTabController(QWidget):
         self._live_msg.connect(self.ui_lblLive.setText)
         self._monitor_open_done.connect(self._on_monitor_open_done)
         self._scan_open_done.connect(self._on_scan_open_done)
+        self._tuned.connect(self._on_tuned)
 
         self.gps_timer = QTimer(self)
         self.gps_timer.setInterval(3000)
@@ -472,6 +480,8 @@ class RFExplorationTabController(QWidget):
         self.waterfall = WaterfallWidget()
         self.waterfall.burst_selected.connect(self._on_waterfall_burst)
         self.waterfall.burst_finalized.connect(self._append_burst_row)
+        self.waterfall.tune_requested.connect(self._on_tune_requested)
+        self.waterfall.ui_record.toggled.connect(self._on_record_toggled)
         splitter.addWidget(self.waterfall)
 
         self.ui_map_frame = QFrame()
@@ -1078,6 +1088,8 @@ class RFExplorationTabController(QWidget):
             b["detail"] += " · " + kind
         vals = [b.get("time_str", ""), b.get("fc", 0.0) / 1e6, "Burst",
                 b["detail"], "-"]
+        self._pin_burst_iq(b)
+        self._harvest_burst(b)
         for cidx, v in enumerate(vals):
             it = QTableWidgetItem("{0:.4f}".format(v) if cidx == 1 else str(v))
             if cidx == 1:
@@ -1126,6 +1138,90 @@ class RFExplorationTabController(QWidget):
 
     # ------------------------------------------- waterfall AI tagging/denoise
 
+    def _on_tune_requested(self, freq_hz):
+        """Right-click 'Tune here' on the waterfall: retune the dongle."""
+        if self.scanner is None or not self.scanner.is_running:
+            self._live_msg.emit("Start Monitor first, then right-click to tune")
+            return
+        freq_hz = float(freq_hz)
+        self._live_msg.emit("Tuning to {0:.4f} MHz ...".format(freq_hz / 1e6))
+
+        def worker():
+            ok = self._restart_scanner(freq_hz)
+            if ok:
+                self.scanner.frequency = freq_hz
+                self._tuned.emit(freq_hz)
+            else:
+                self._live_msg.emit("Retune to {0:.4f} MHz failed".format(
+                    freq_hz / 1e6))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_tuned(self, freq_hz):
+        srate = getattr(self.scanner, "sample_rate", None) or 1_024_000
+        self.waterfall.set_stream(freq_hz, srate)
+        self.waterfall.reset()
+        self._live_msg.emit("Center: {0:.4f} MHz @ {1:.2f} MS/s".format(
+            freq_hz / 1e6, srate / 1e6))
+
+    def _on_record_toggled(self, on):
+        self._recording = bool(on)
+        if on:
+            from pathlib import Path
+            self._harvest_dir = Path.home() / "Documents" / "repos" / \
+                "RadioLLM" / "captures"
+            self._harvest_dir.mkdir(parents=True, exist_ok=True)
+            self._manifest_path = self._harvest_dir / "manifest.jsonl"
+            self._harvest_bytes = sum(
+                f.stat().st_size for f in self._harvest_dir.glob("*.complex16s"))
+            self._live_msg.emit(
+                "Recording bursts -> {0} ({1:.0f} MB already there)".format(
+                    self._harvest_dir, self._harvest_bytes / 1e6))
+        else:
+            self._live_msg.emit("Burst recording off")
+
+    def _harvest_burst(self, b):
+        """Save a finalized burst + metadata for RadioLLM fine-tuning."""
+        if not self._recording:
+            return
+        if self._harvest_bytes >= self.HARVEST_MAX_BYTES:
+            self.waterfall.ui_record.blockSignals(True)
+            self.waterfall.ui_record.setChecked(False)
+            self.waterfall.ui_record.blockSignals(False)
+            self._recording = False
+            self._live_msg.emit("Harvest cap (500 MB) reached - recording stopped")
+            return
+        try:
+            if b.get("_iq") is not None:
+                iq, sr = b["_iq"], b.get("_iq_sr", 0.0)
+            else:
+                iq, sr = self.waterfall.extract_burst_iq(b)
+            if iq is None or iq.size < 4096 or iq.size > 8_000_000:
+                return
+            ts = datetime.now().strftime("%Y%m%d_%H-%M-%S_%f")[:-3]
+            fname = "burst_{0:.4f}MHz_{1}.complex16s".format(b.get("fc", 0) / 1e6, ts)
+            path = self._harvest_dir / fname
+            RadioLLMClient.save_iq(str(path), np.asarray(iq, dtype=np.complex64))
+            size = path.stat().st_size
+            self._harvest_bytes += size
+            provider = getattr(self, "gps_provider", None)
+            pos = provider.position if provider is not None else None
+            entry = {
+                "file": fname,
+                "fc": float(b.get("fc", 0.0)),
+                "sample_rate": float(sr),
+                "bw": float(b.get("bw", 0.0)),
+                "snr": float(b.get("snr", 0.0)),
+                "t0": b.get("t0"), "t1": b.get("t1"),
+                "label": b.get("label", ""),
+                "detail": b.get("detail", ""),
+                "gps": list(pos[:2]) if pos else None,
+            }
+            with open(self._manifest_path, "a") as fh:
+                fh.write(json.dumps(entry) + "\n")
+        except Exception:
+            logger.exception("burst harvest failed")
+
     def _on_waterfall_burst(self, burst):
         menu = QMenu(self)
         label = burst.get("label", "burst")
@@ -1163,8 +1259,30 @@ class RFExplorationTabController(QWidget):
                 bw / WF_COLS * (self.waterfall.sample_rate / 1e3)))
         return " · ".join(parts)
 
+    def _pin_burst_iq(self, b):
+        """Snapshot the burst IQ at finalize time (ring only keeps ~10 s)."""
+        if b.get("_iq") is not None:
+            return
+        try:
+            iq, sr = self.waterfall.extract_burst_iq(b)
+            if iq is None or iq.size < 4096:
+                return
+            if iq.size > 4_000_000:
+                iq = iq[:4_000_000]
+            b["_iq"] = np.asarray(iq, dtype=np.complex64)
+            b["_iq_sr"] = float(sr)
+            self._pinned.append(b)
+            while len(self._pinned) > 12:
+                old = self._pinned.pop(0)
+                old["_iq"] = None
+        except Exception:
+            pass
+
     def _denoise_waterfall_burst(self, burst, open_result=True, origin=""):
-        iq, sr = self.waterfall.extract_burst_iq(burst)
+        if burst.get("_iq") is not None:
+            iq, sr = burst["_iq"], burst.get("_iq_sr", 0.0)
+        else:
+            iq, sr = self.waterfall.extract_burst_iq(burst)
         if iq is None or iq.size < 4096:
             QMessageBox.information(self, "RadioLLM",
                                     "Not enough buffered IQ for that burst yet.\n"
