@@ -12,7 +12,8 @@ def analyze_signal(iq8, center_freq, sample_rate, fft_averages=1):
     :param fft_averages: number of FFT windows to power-average. Averaging
         lowers the noise variance (up to ~10*log10(N) dB SNR gain for a tone),
         which lets weak, far-away signals clear the detection threshold.
-    :return: dict with fft freqs/db, detected peaks, bandwidth, noise floor
+    :return: dict with fft freqs/db, detected peaks, bandwidth, noise floor,
+        plus ADC saturation diagnostics ("clip_ratio", "saturated").
     """
     result = {
         "n_fft": 0,
@@ -25,8 +26,11 @@ def analyze_signal(iq8, center_freq, sample_rate, fft_averages=1):
         "n_peaks": 0,
         "freqs_hz": None,
         "mag_db": None,
+        "clip_ratio": None,
+        "saturated": False,
     }
     iq = np.asarray(iq8)
+    raw = iq
     if iq.ndim == 2:
         if iq.shape[0] < 128 or iq.shape[1] < 2:
             return result
@@ -36,6 +40,23 @@ def analyze_signal(iq8, center_freq, sample_rate, fft_averages=1):
             return result
         samples = iq.astype(np.complex64)
     n = len(samples)
+
+    # ADC saturation check: RTL-SDR int8 converters rail at +/-127. When many
+    # samples touch the rail the front-end gain is too high - the capture is
+    # clipped, producing harmonics that masquerade as emitters at other
+    # frequencies and pegging the RSSI near full scale.
+    if np.issubdtype(raw.dtype, np.integer):
+        info = np.iinfo(raw.dtype)
+        rail = max(abs(int(info.min)), abs(int(info.max)))
+        tol = rail - int(round(rail * 0.005))  # within 0.5% of the rail
+        # int32 cast: np.abs(-128) overflows int8
+        clip_ratio = float(
+            np.count_nonzero(np.abs(raw.astype(np.int32)) >= tol)
+        ) / raw.size
+    else:
+        clip_ratio = float(np.count_nonzero(np.abs(samples) >= 0.995)) / n
+    result["clip_ratio"] = clip_ratio
+    result["saturated"] = clip_ratio >= 0.002  # 0.2% of values at the rail
     nfft = 1 << int(np.floor(np.log2(n)))
     nfft = min(nfft, 1 << 16)
     if nfft < 128:
@@ -164,9 +185,14 @@ def _lobe_width(mag_db, idx, peak_db, drop_db, bin_width, nfft):
 
 def peaks_summary(analysis) -> str:
     """Short human-readable summary for the samples table."""
+    if analysis is None:
+        return "-"
     n = analysis.get("n_peaks", 0)
     if n == 0:
-        return "no peaks"
+        return "saturated (clipped)" if analysis.get("saturated") else "no peaks"
     top = analysis["peaks"][0]
     bw = analysis.get("bandwidth_hz", 0.0) / 1e3
-    return "{0} peaks {1:.3f} MHz {2:.0f} kHz".format(n, top["freq_mhz"], bw)
+    prefix = "[SAT] " if analysis.get("saturated") else ""
+    return "{0}{1} peaks {2:.3f} MHz {3:.0f} kHz".format(
+        prefix, n, top["freq_mhz"], bw
+    )

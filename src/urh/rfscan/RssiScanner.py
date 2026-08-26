@@ -11,6 +11,19 @@ from urh.util.Logger import logger
 
 
 class RssiScanner(QObject):
+    spectrum_sinks = None
+
+    def add_spectrum_sink(self, fn):
+        """Register fn(iq_complex64, freq_hz) called per read chunk (scanner thread)."""
+        if self.spectrum_sinks is None:
+            self.spectrum_sinks = []
+        if fn not in self.spectrum_sinks:
+            self.spectrum_sinks.append(fn)
+
+    def remove_spectrum_sink(self, fn):
+        if self.spectrum_sinks and fn in self.spectrum_sinks:
+            self.spectrum_sinks.remove(fn)
+
     """Continuously measures the received signal power (RSSI) on one frequency.
 
     Keeps the SDR open and computes the average power of each new IQ chunk,
@@ -201,6 +214,12 @@ class RssiScanner(QObject):
                         else:
                             self._last_chunk = np.concatenate((self._last_chunk[chunk.shape[0]:], chunk))
                     self.rssi_updated.emit(rssi, time.time())
+                    if self.spectrum_sinks:
+                        for fn in self.spectrum_sinks:
+                            try:
+                                fn(chunk, self.frequency)
+                            except Exception:
+                                logger.exception("spectrum sink error")
             except Exception as e:
                 logger.error("RssiScanner read error: {0}".format(e))
                 self.device_error.emit(str(e))

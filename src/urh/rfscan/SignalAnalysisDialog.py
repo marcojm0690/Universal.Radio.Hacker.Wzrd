@@ -1,4 +1,6 @@
+import glob
 import json
+import os
 import threading
 import urllib.request
 
@@ -21,6 +23,8 @@ from PyQt6.QtWidgets import (
 )
 
 from urh import settings
+from urh.rfscan.RadioLLMClient import DEFAULT_RADIOLLM_URL, RadioLLMError
+from urh.rfscan import RadioLLMClient
 from urh.util.Logger import logger
 
 DEFAULT_LMSTUDIO_URL = "http://localhost:1234"
@@ -113,17 +117,22 @@ class SignalAnalysisDialog(QDialog):
     """Shows the spectral dissection of one captured sample."""
 
     ai_result = pyqtSignal(str, bool)
+    denoise_result = pyqtSignal(bool, str)
 
-    def __init__(self, sample, analysis, parent=None, capture_cb=None):
+    def __init__(self, sample, analysis, parent=None, capture_cb=None,
+                 bursts_dir=None, open_file_cb=None):
         super().__init__(parent)
         self.sample = sample
         self.analysis = analysis
         self._capture_cb = capture_cb
+        self._bursts_dir = bursts_dir
+        self._open_file_cb = open_file_cb
         self.setWindowTitle(
             "Signal dissection - {0:.3f} MHz".format(sample["freq"] / 1e6)
         )
         self.setMinimumSize(760, 560)
         self.ai_result.connect(self._on_ai_result)
+        self.denoise_result.connect(self._on_denoise_result)
         self._build_ui()
 
     def _build_ui(self):
@@ -154,7 +163,18 @@ class SignalAnalysisDialog(QDialog):
             )
         else:
             info = "No spectrum data captured for this sample."
-        layout.addWidget(QLabel(info))
+        lbl = QLabel(info)
+        layout.addWidget(lbl)
+        if a is not None and a.get("saturated"):
+            clip = a.get("clip_ratio", 0.0)
+            lbl.setText(
+                info
+                + "\nADC SATURATED: {0:.2f}% of I/Q values clipped at the rail. "
+                "Peak amplitudes/harmonics are unreliable - lower the gain and rescan.".format(
+                    clip * 100.0
+                )
+            )
+            lbl.setStyleSheet("color: #e06c6c;")
 
         self.ui_peaks = QTableWidget(0, 5)
         self.ui_peaks.setHorizontalHeaderLabels(
@@ -191,6 +211,22 @@ class SignalAnalysisDialog(QDialog):
         )
         self.ui_btn_ai.clicked.connect(self._start_ai_analysis)
         ai_row.addWidget(self.ui_btn_ai)
+
+        self.ui_radiollm_url = QLineEdit(
+            settings.read("radiollm_url", DEFAULT_RADIOLLM_URL, str)
+        )
+        self.ui_radiollm_url.setPlaceholderText(DEFAULT_RADIOLLM_URL)
+        self.ui_radiollm_url.setMinimumWidth(240)
+        ai_row.addWidget(QLabel("RadioLLM:"))
+        ai_row.addWidget(self.ui_radiollm_url, 1)
+        self.ui_btn_denoise = QPushButton("Denoise burst")
+        self.ui_btn_denoise.setToolTip(
+            "Send the most recent captured burst at this frequency to the "
+            "local RadioLLM sidecar for neural denoising; the result is "
+            "saved as <burst>_denoised.complex16s and opened in URH."
+        )
+        self.ui_btn_denoise.clicked.connect(self._start_radiollm_denoise)
+        ai_row.addWidget(self.ui_btn_denoise)
         layout.addLayout(ai_row)
 
         self.ui_ai_output = QPlainTextEdit()
@@ -246,6 +282,83 @@ class SignalAnalysisDialog(QDialog):
                 "No IQ data was captured. Check the RTL-SDR connection "
                 "(unplug and re-plug the dongle) and try again.",
             )
+
+    # ------------------------------------------------- RadioLLM denoising
+
+    def _latest_burst_path(self):
+        """Most recent captured burst file for this sample's frequency."""
+        if not self._bursts_dir:
+            return None
+        prefix = "burst_{0:.3f}MHz_".format(self.sample["freq"] / 1e6)
+        candidates = sorted(
+            glob.glob(os.path.join(self._bursts_dir, prefix + "*.complex16s"))
+        )
+        return candidates[-1] if candidates else None
+
+    def _start_radiollm_denoise(self):
+        url = (self.ui_radiollm_url.text() or DEFAULT_RADIOLLM_URL).strip()
+        settings.write("radiollm_url", url)
+        path = self._latest_burst_path()
+        if path is None:
+            QMessageBox.information(
+                self,
+                "No burst to denoise",
+                "No captured burst found for {0:.3f} MHz.\n\n"
+                "Use 'Capture burst & analyze in URH' first, then denoise "
+                "the recording.".format(self.sample["freq"] / 1e6),
+            )
+            return
+        sr = self.analysis.get("sample_rate", 0.0) if self.analysis else 0.0
+        freq = self.sample["freq"]
+        self.ui_btn_denoise.setEnabled(False)
+        self.ui_ai_output.setPlainText(
+            "RadioLLM: denoising {0} via sidecar at {1} ...".format(
+                os.path.basename(path), url
+            )
+        )
+        threading.Thread(
+            target=self._run_denoise_worker,
+            args=(url, path, sr, freq),
+            daemon=True,
+        ).start()
+
+    def _run_denoise_worker(self, url, path, sample_rate, center_freq):
+        try:
+            out_path, stats = RadioLLMClient.denoise(
+                path,
+                url=url,
+                sample_rate=sample_rate,
+                center_freq=center_freq,
+            )
+            msg = (
+                "RadioLLM denoise complete:\n"
+                "- input : {0} ({1} samples)\n"
+                "- output: {2}\n"
+                "- sidecar compute: {3}s (total {4}s)\n"
+                "- residual-power metric: {5} dB".format(
+                    os.path.basename(path), stats["samples"],
+                    out_path, stats["elapsed_s"], stats["total_s"],
+                    stats["snr_proxy_db"],
+                )
+            )
+            self.denoise_result.emit(True, msg)
+        except RadioLLMError as e:
+            logger.error("RadioLLM denoise failed: {0}".format(e))
+            self.denoise_result.emit(False,
+                                     "RadioLLM denoise failed: {0}".format(e))
+
+    def _on_denoise_result(self, ok, message):
+        self.ui_btn_denoise.setEnabled(True)
+        self.ui_ai_output.setStyleSheet("" if ok else "color: #e06c6c;")
+        self.ui_ai_output.setPlainText(message)
+        if ok and self._open_file_cb is not None:
+            out_path = message.split("output: ")[1].split("\n")[0]
+            try:
+                self._open_file_cb(out_path)
+            except Exception as e:
+                logger.error(
+                    "Could not open denoised file in URH: {0}".format(e)
+                )
 
     # ------------------------------------------------------------- AI analysis
 
@@ -312,6 +425,22 @@ class SignalAnalysisDialog(QDialog):
             if sig is not None
             else "Signal RSSI (narrowband): n/a (no peak detected)"
         )
+        if a.get("saturated"):
+            lines.append(
+                "ADC saturation: YES ({0:.2f}% of I/Q values clipped at the "
+                "converter rail). The receiver front-end was overloaded: peak "
+                "amplitudes and any extra spurs/harmonics are unreliable, and "
+                "the dominant peak may be clipping distortion. Recommend "
+                "lowering the RF gain.".format(a.get("clip_ratio", 0.0) * 100.0)
+            )
+        else:
+            clip = a.get("clip_ratio")
+            if clip is not None:
+                lines.append(
+                    "ADC saturation: none ({0:.4f}% of values near the rail)".format(
+                        clip * 100.0
+                    )
+                )
         lines.append(
             "Occupied bandwidth: {0:.1f} kHz".format(a.get("bandwidth_hz", 0.0) / 1e3)
         )

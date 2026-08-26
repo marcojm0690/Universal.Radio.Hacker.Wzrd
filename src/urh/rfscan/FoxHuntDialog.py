@@ -113,12 +113,18 @@ class FoxHuntDialog(QDialog):
             return []
         return self.controller._filtered_samples()
 
+    def _clean_samples(self):
+        """Samples fit for RSSI-based DF: saturated readings are pegged near
+        full scale, so they carry no distance information and would poison
+        the trilateration fit."""
+        return [s for s in self._samples() if not s.get("saturated")]
+
     def _origin(self):
         """Origin for bearing plots: current GPS fix, else survey centroid."""
         provider = self.controller.gps_provider if self.controller else None
         if provider is not None and provider.has_fix():
             return provider.position[0], provider.position[1]
-        samples = self._samples()
+        samples = self._clean_samples()
         if samples:
             coords = [(s["lat"], s["lon"], s["rssi"]) for s in samples]
             cen = weighted_centroid(coords)
@@ -127,7 +133,7 @@ class FoxHuntDialog(QDialog):
         return None
 
     def _estimate(self):
-        samples = self._samples()
+        samples = self._clean_samples()
         if len(samples) < 3:
             return None
         coords = [(s["lat"], s["lon"], s["rssi"]) for s in samples]
@@ -137,11 +143,12 @@ class FoxHuntDialog(QDialog):
 
     def _refresh(self):
         samples = self._samples()
+        clean = self._clean_samples()
         origin = self._origin()
         estimate = self._estimate()
 
         points = []
-        for s in samples:
+        for s in clean:
             if origin is None:
                 continue
             brg = compass_bearing(origin[0], origin[1], s["lat"], s["lon"])
@@ -192,7 +199,13 @@ class FoxHuntDialog(QDialog):
             self.ui_lblCentroid.setText("{0:.6f}, {1:.6f}".format(origin[0], origin[1]))
         else:
             self.ui_lblCentroid.setText("-")
-        self.ui_lblSamples.setText(str(len(samples)))
+        n_sat = len(samples) - len(clean)
+        if n_sat > 0:
+            self.ui_lblSamples.setText(
+                "{0} usable ({1} saturated, excluded)".format(len(clean), n_sat)
+            )
+        else:
+            self.ui_lblSamples.setText(str(len(samples)))
         self.ui_lblHeading.setText("n/a")
 
     # ----------------------------------------------------------------- export

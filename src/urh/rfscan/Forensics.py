@@ -39,6 +39,10 @@ def _sample_record(sample):
         if a.get("signal_rssi_db") is not None
         else None,
         "peaks": peaks,
+        "saturated": bool(a.get("saturated")),
+        "clip_ratio": round(a.get("clip_ratio"), 6)
+        if a.get("clip_ratio") is not None
+        else None,
         "analysis_summary": peaks_summary(a) if a else None,
         "ai_analysis": (sample.get("ai_analysis") or "").strip() or None,
         "ai_error": (sample.get("ai_error") or "").strip() or None,
@@ -144,7 +148,7 @@ def render_html(case) -> str:
         elif s.get("ai_error"):
             ai = "<div class='ai-err'>{0}</div>".format(_escape(s["ai_error"]))
         rows.append(
-            "<tr>"
+            "<tr{cls}>"
             "<td>{freq:.3f}</td>"
             "<td>{lat:.6f}</td>"
             "<td>{lon:.6f}</td>"
@@ -152,6 +156,7 @@ def render_html(case) -> str:
             "<td>{date}</td><td>{time}</td>"
             "<td>{summary}{peaks}{ai}</td>"
             "</tr>".format(
+                cls=" class='sat'" if s.get("saturated") else "",
                 freq=s["freq_mhz"],
                 lat=s["latitude"],
                 lon=s["longitude"],
@@ -187,6 +192,7 @@ def render_html(case) -> str:
   td {{ padding:4px 8px; border-bottom:1px solid #1e2630; vertical-align:top; }}
   tr:first-child td {{ color:#fff; font-weight:bold; }}
   .peaks {{ color:#9ecbff; font-size:12px; margin-top:4px; }}
+  .sat td {{ background:#3a1414; }}
   .ai {{ background:#0d1117; padding:8px; border-radius:6px; font:12px/1.5 ui-monospace, monospace; white-space:pre-wrap; color:#c8d3dc; }}
   .ai-err {{ color:#e06c6c; }}
   details {{ margin-top:6px; }}
