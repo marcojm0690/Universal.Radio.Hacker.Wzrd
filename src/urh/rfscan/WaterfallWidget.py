@@ -266,40 +266,52 @@ class _Canvas(QWidget):
             self._floor_seeded = True
             return []
         self._noise_floor = 0.98 * self._noise_floor + 0.02 * row_db
-        hot = row_db > self._noise_floor + 8.0
-        spans = []
+        hot = row_db > self._noise_floor + 12.0
+        raw_spans = []
         c = 0
         while c < COLS:
             if hot[c]:
                 c0 = c
                 while c < COLS and hot[c]:
                     c += 1
-                if c - c0 >= 2:
-                    spans.append((c0, c - 1))
+                if c - c0 >= 4:
+                    raw_spans.append((c0, c - 1))
             else:
                 c += 1
+        # One emission can dip below threshold for a column or two (envelope
+        # ripple, FFT-bin noise) and get sliced into two adjacent runs here;
+        # merge those back together so a single signal can't spawn a second,
+        # overlapping track that flickers in as a duplicate burst box.
+        spans = []
+        for lo, hi in raw_spans:
+            if spans and lo - spans[-1][1] <= 4:
+                spans[-1] = (spans[-1][0], hi)
+            else:
+                spans.append((lo, hi))
         unmatched = list(range(len(spans)))
         for tr in self._active:
             best, best_d = None, 1e9
             for i in unmatched:
                 lo, hi = spans[i]
                 d = max(lo - tr["hi"], tr["lo"] - hi, 0)
-                if d < best_d and d <= 6:
+                if d < best_d and d <= 4:
                     best, best_d = i, d
             if best is not None:
                 lo, hi = spans[best]
                 tr["lo"], tr["hi"] = min(tr["lo"], lo), max(tr["hi"], hi)
                 tr["peak"] = max(tr.get("peak", -120.0), float(row_db[lo:hi + 1].max()))
                 tr["miss"] = 0
+                tr["rows_active"] = tr.get("rows_active", 0) + 1
                 unmatched.remove(best)
             else:
                 tr["miss"] += 1
         for i in unmatched:
             lo, hi = spans[i]
             self._active.append({"lo": lo, "hi": hi, "miss": 0,
+                                 "rows_active": 1,
                                  "t0": self._row_times[-1] if self._row_times else time.time(),
                                  "peak": float(row_db[lo:hi + 1].max())})
-        done = [tr for tr in self._active if tr["miss"] >= 8]
+        done = [tr for tr in self._active if tr["miss"] >= 8 and tr.get("rows_active", 0) >= 3]
         out = []
         for tr in done:
             if self._row_times:
@@ -391,6 +403,13 @@ class _Canvas(QWidget):
     # ---- paint
 
     def paintEvent(self, event):
+        try:
+            self._paint_impl(event)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("paintEvent failed")
+
+    def _paint_impl(self, event):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor(8, 10, 14))
         plot = self._plot_rect()
@@ -440,9 +459,13 @@ class _Canvas(QWidget):
             p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             sx0 = int(self.zx0 * COLS)
             sx1 = int(np.ceil(self.zx1 * COLS))
-            src = self._pixmap.copy(sx0, ROWS - self._img_rows,
-                                    max(sx1 - sx0, 1), self._img_rows)
-            p.drawPixmap(QRectF(wf_r), src, QRectF(src.rect()))
+            # Draw straight from the source rect instead of pixmap.copy()ing
+            # a cropped sub-pixmap first: paintEvent fires on every mouse
+            # move (hover/pan/zoom), and re-allocating + copying pixel data
+            # that often was the main source of interaction stutter.
+            src_rect = QRectF(sx0, ROWS - self._img_rows,
+                              max(sx1 - sx0, 1), self._img_rows)
+            p.drawPixmap(QRectF(wf_r), self._pixmap, src_rect)
         else:
             p.setPen(QColor(90, 100, 115))
             p.drawText(wf_r, Qt.AlignmentFlag.AlignCenter,
@@ -571,8 +594,11 @@ class _Canvas(QWidget):
         txt = "{:.4f} MHz".format(fx / 1e6)
         if len(self._row_times) >= 2:
             t_new, t_old = self._row_times[-1], self._row_times[0]
-            frac = (r.bottom() - hy) / max(r.height(), 1)
-            t = t_old + frac * (t_new - t_old)
+            if self.flip_rows:
+                frac = (hy - r.top()) / max(r.height(), 1)
+            else:
+                frac = (r.bottom() - hy) / max(r.height(), 1)
+            t = t_new - frac * (t_new - t_old)
             txt += "  " + _fmt_time(t)
         p.setPen(QColor(210, 214, 225))
         p.drawText(hx + 8, hy - 6, txt)
@@ -632,11 +658,20 @@ class _Canvas(QWidget):
         self.update()
 
     def contextMenuEvent(self, e):
+        try:
+            self._context_menu_impl(e)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("contextMenuEvent failed")
+
+    def _context_menu_impl(self, e):
         menu = QMenu(self)
         r = self._wf_rect()
         act_tune = None
-        if r.contains(e.pos()):
-            col_f = self._x_to_col(e.position().x(), r) / COLS
+        from PyQt6.QtCore import QPointF
+        pt = QPointF(e.pos())
+        if r.contains(pt):
+            col_f = self._x_to_col(pt.x(), r) / COLS
             f = self.center_freq - self.sample_rate / 2 + col_f * self.sample_rate
             act_tune = menu.addAction(
                 "Tune here \u2192 {0:.4f} MHz".format(f / 1e6))
@@ -649,7 +684,7 @@ class _Canvas(QWidget):
         if chosen is None:
             return
         if act_tune is not None and chosen == act_tune:
-            col_f = self._x_to_col(e.position().x(), r) / COLS
+            col_f = self._x_to_col(pt.x(), r) / COLS
             f = self.center_freq - self.sample_rate / 2 + col_f * self.sample_rate
             self.tune_requested.emit(float(f))
         elif chosen == act_flip:

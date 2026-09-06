@@ -1018,25 +1018,34 @@ class RFExplorationTabController(QWidget):
 
     def _append_table_row(self, s):
         """Add one fox-hunt RSSI sample to the unified events table."""
-        row = self.ui_table.rowCount()
-        self.ui_table.insertRow(row)
         vals = [s["time_str"], s["freq"] / 1e6, "RSSI",
                 "{0:.1f} dB {1}".format(s["rssi"], peaks_summary(s["analysis"])).strip(),
                 "{0:.5f}, {1:.5f}".format(s["lat"], s["lon"])]
-        for cidx, v in enumerate(vals):
-            it = QTableWidgetItem("{0:.4f}".format(v) if cidx == 1 else str(v))
-            if cidx == 1:
-                it.setData(Qt.ItemDataRole.DisplayRole, float(v))
-            it.setData(Qt.ItemDataRole.UserRole, ("sample", s))
-            self.ui_table.setItem(row, cidx, it)
-        if s.get("saturated"):
-            red = QColor(90, 30, 30)
-            for col in range(self.ui_table.columnCount()):
-                item = self.ui_table.item(row, col)
-                if item is not None:
-                    item.setBackground(red)
-        if self.ui_table.rowCount() > 500:
-            self.ui_table.removeRow(0)
+        # Sorting is enabled on this table so header clicks can re-order it;
+        # inserting a row while it's live triggers a re-sort after EACH
+        # setItem() call, which silently moves the row mid-population and
+        # scrambles values into whatever row lands at the old index. Build
+        # the row with sorting off, then let it settle once at the end.
+        self.ui_table.setSortingEnabled(False)
+        try:
+            row = self.ui_table.rowCount()
+            self.ui_table.insertRow(row)
+            for cidx, v in enumerate(vals):
+                it = QTableWidgetItem("{0:.4f}".format(v) if cidx == 1 else str(v))
+                if cidx == 1:
+                    it.setData(Qt.ItemDataRole.DisplayRole, float(v))
+                it.setData(Qt.ItemDataRole.UserRole, ("sample", s))
+                self.ui_table.setItem(row, cidx, it)
+            if s.get("saturated"):
+                red = QColor(90, 30, 30)
+                for col in range(self.ui_table.columnCount()):
+                    item = self.ui_table.item(row, col)
+                    if item is not None:
+                        item.setBackground(red)
+            if self.ui_table.rowCount() > 500:
+                self.ui_table.removeRow(0)
+        finally:
+            self.ui_table.setSortingEnabled(True)
 
     def _infer_burst_kind(self, iq, sr):
         """Cheap local inference from IQ: pulse structure +
@@ -1081,8 +1090,6 @@ class RFExplorationTabController(QWidget):
 
     def _append_burst_row(self, b):
         """Add one waterfall burst to the unified events table."""
-        row = self.ui_table.rowCount()
-        self.ui_table.insertRow(row)
         band = (b.get("label", "burst").split("  ", 1) + ["burst"])[1]
         b["detail"] = "{0} \u00b7 ~{1:.0f} kHz \u00b7 SNR {2:.0f} dB \u00b7 analyzing\u2026".format(
             band, b.get("bw", 0.0) / 1e3, b.get("snr", 0.0))
@@ -1091,14 +1098,22 @@ class RFExplorationTabController(QWidget):
         # heavy IQ snapshot + optional disk write happen off the GUI thread
         self._bg_q.append(b)
         self._bg_evt.set()
-        for cidx, v in enumerate(vals):
-            it = QTableWidgetItem("{0:.4f}".format(v) if cidx == 1 else str(v))
-            if cidx == 1:
-                it.setData(Qt.ItemDataRole.DisplayRole, float(v))
-            it.setData(Qt.ItemDataRole.UserRole, ("burst", b))
-            self.ui_table.setItem(row, cidx, it)
-        if self.ui_table.rowCount() > 500:
-            self.ui_table.removeRow(0)
+        # See _append_table_row: sorting must be off while the row is built,
+        # otherwise a re-sort mid-insert scrambles values into other rows.
+        self.ui_table.setSortingEnabled(False)
+        try:
+            row = self.ui_table.rowCount()
+            self.ui_table.insertRow(row)
+            for cidx, v in enumerate(vals):
+                it = QTableWidgetItem("{0:.4f}".format(v) if cidx == 1 else str(v))
+                if cidx == 1:
+                    it.setData(Qt.ItemDataRole.DisplayRole, float(v))
+                it.setData(Qt.ItemDataRole.UserRole, ("burst", b))
+                self.ui_table.setItem(row, cidx, it)
+            if self.ui_table.rowCount() > 500:
+                self.ui_table.removeRow(0)
+        finally:
+            self.ui_table.setSortingEnabled(True)
 
     def _on_cell_double_clicked(self, row, _column):
         item = self.ui_table.item(row, 0)
