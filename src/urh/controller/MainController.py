@@ -16,7 +16,6 @@ from urh import settings, version
 from urh.controller.AIAnalysisTabController import AIAnalysisTabController
 from urh.controller.CompareFrameController import CompareFrameController
 from urh.controller.GeneratorTabController import GeneratorTabController
-from urh.controller.RFExplorationTabController import RFExplorationTabController
 from urh.controller.SignalTabController import SignalTabController
 from urh.controller.SimulatorTabController import SimulatorTabController
 from urh.controller.dialogs.CSVImportDialog import CSVImportDialog
@@ -86,11 +85,6 @@ class MainController(QMainWindow):
             self.compare_frame_controller, parent=self.ui.tab_ai
         )
         self.ui.tab_ai.layout().addWidget(self.ai_analysis_tab_controller)
-
-        self.rf_exploration_tab_controller = RFExplorationTabController(
-            main_controller=self, parent=self.ui.tab_rf
-        )
-        self.ui.tab_rf.layout().addWidget(self.rf_exploration_tab_controller)
 
         self.undo_group = QUndoGroup()
         self.undo_group.addStack(self.signal_tab_controller.signal_undo_stack)
